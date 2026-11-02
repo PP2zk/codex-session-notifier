@@ -1,0 +1,173 @@
+{
+  "name": "codex-session-notifier",
+  "displayName": "Codex Session Notifier",
+  "icon": "resources/icon.png",
+  "description": "Monitor local and SSH Codex sessions and receive reply completion notifications through pushplus channels.",
+  "version": "0.0.21",
+  "license": "MIT",
+  "private": true,
+  "publisher": "PP2zk",
+  "engines": {
+    "vscode": "^1.73.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/src/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "codexSessionNotifier.openMenu",
+        "title": "Codex Session Notifier: Open Menu"
+      },
+      {
+        "command": "codexSessionNotifier.refreshStatus",
+        "title": "Codex Session Notifier: Refresh Sessions"
+      },
+      {
+        "command": "codexSessionNotifier.openSettings",
+        "title": "Codex Session Notifier: Open Settings"
+      },
+      {
+        "command": "codexSessionNotifier.inspect",
+        "title": "Codex Session Notifier: Inspect Source"
+      },
+      {
+        "command": "codexSessionNotifier.showStatus",
+        "title": "Codex Session Notifier: Show Status"
+      },
+      {
+        "command": "codexSessionNotifier.selectChannel",
+        "title": "Codex Session Notifier: Select Notification Channel"
+      },
+      {
+        "command": "codexSessionNotifier.configureToken",
+        "title": "Codex Session Notifier: Configure pushplus Token"
+      },
+      {
+        "command": "codexSessionNotifier.testNotification",
+        "title": "Codex Session Notifier: Send Test Notification"
+      },
+      {
+        "command": "codexSessionNotifier.enableNotifications",
+        "title": "Codex Session Notifier: Enable Notifications"
+      },
+      {
+        "command": "codexSessionNotifier.disableNotifications",
+        "title": "Codex Session Notifier: Disable Notifications"
+      },
+      {
+        "command": "codexSessionNotifier.removeToken",
+        "title": "Codex Session Notifier: Remove pushplus Token"
+      },
+      {
+        "command": "codexSessionNotifier.deliveryStatus",
+        "title": "Codex Session Notifier: Show Delivery Status"
+      }
+    ],
+    "configuration": {
+      "title": "Codex Session Notifier",
+      "properties": {
+        "codexSessionNotifier.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Automatically monitor this window's local or SSH Codex source. Delivery is enabled separately with Enable Notifications."
+        },
+        "codexSessionNotifier.machineLabel": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional label for this source. Empty uses the actual host returned by the reader."
+        },
+        "codexSessionNotifier.sources": {
+          "type": "object",
+          "default": {},
+          "scope": "machine",
+          "description": "Per-source overrides keyed by local or an existing SSH Host alias.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "codexHome": {
+                "type": "string"
+              },
+              "machineLabel": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "codexSessionNotifier.codexHome": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Codex home on the selected host. Empty uses that host's CODEX_HOME or ~/.codex."
+        },
+        "codexSessionNotifier.sshHost": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Existing SSH Host alias for this remote window. Empty derives a simple alias from its Remote SSH authority."
+        },
+        "codexSessionNotifier.pythonExecutable": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Existing local Python executable. Empty uses python on Windows and python3 elsewhere. No packages are installed."
+        },
+        "codexSessionNotifier.sshExecutable": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Existing local SSH executable. Empty uses the system OpenSSH client. Does not change system or Remote SSH settings."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "package": "npm run compile && vsce package --pre-release --githubBranch publish --out artifacts/codex-session-notifier-0.0.21.vsix",
+    "test": "npm run compile && node --test out/test/*.test.js && python -I -m unittest discover -s test -p test_*.py",
+    "test:extension": "npm run compile && node scripts/test-extension.mjs",
+    "probe": "node out/src/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.0",
+    "@types/vscode": "1.73.0",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "4.0.0",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "@perk-net/perk-pushplus-sdk": "1.2.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PP2zk/codex-session-notifier.git"
+  },
+  "homepage": "https://github.com/PP2zk/codex-session-notifier/tree/publish",
+  "bugs": {
+    "url": "https://github.com/PP2zk/codex-session-notifier/issues"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "codex",
+    "notifications",
+    "pushplus",
+    "remote-ssh"
+  ]
+}

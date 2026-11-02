@@ -1,0 +1,32 @@
+# Dependencies, generated output and isolated integration data
+node_modules/
+out/
+artifacts/
+.vscode-test/
+__pycache__/
+*.py[cod]
+*.vsix
+*.log
+
+# Local development context and task databases
+.beads/
+.beads*
+.agents/
+.codex/
+.vscode/
+AGENTS.md
+.dolt/
+*.db
+*.sqlite
+*.sqlite-*
+
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+.npmrc
+release/
