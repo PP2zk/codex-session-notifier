@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Source, validateSshHost } from "./source";
+import { Source, SshSource, validateSshSource } from "./source";
 
 export interface ProbeResult {
   schemaVersion: 1;
@@ -24,6 +24,14 @@ export function remoteCommand(request: string): string {
 
 export interface ReaderOptions { home?: string; python?: string; ssh?: string; signal?: AbortSignal }
 
+export function sshArguments(source: SshSource): string[] {
+  const target = validateSshSource(source);
+  return ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1",
+    "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1",
+    ...(target.user === undefined ? [] : ["-l", target.user]),
+    ...(target.port === undefined ? [] : ["-p", String(target.port)]), target.host, remoteCommand("e30=")];
+}
+
 export function readerInput(script: string, request: unknown): string {
   const encoded = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
   if (encoded.length > 262144) throw new Error("request_budget_exceeded");
@@ -40,9 +48,7 @@ export async function runReader(root: string, source: Source, request: unknown, 
     args = ["-I", "-"];
   } else {
     executable = options.ssh || (process.platform === "win32" ? join(process.env.SystemRoot || "C:\\Windows", "System32", "OpenSSH", "ssh.exe") : "ssh");
-    args = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1",
-      "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", validateSshHost(source.host),
-      remoteCommand("e30=")];
+    args = sshArguments(source);
   }
   const input = readerInput(await readFile(scriptPath, "utf8"), request);
   return new Promise((resolve, reject) => {

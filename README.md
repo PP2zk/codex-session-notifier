@@ -92,7 +92,7 @@ An empty label uses the actual hostname returned by the reader. `sshExecutable` 
 
 A symlinked Codex home is resolved automatically. For example, `/home/user/.codex` pointing to `/data/user/.codex` uses the same source identity as the real directory. No directory move or extra source configuration is needed for this layout. Files must remain inside the matching native `sessions` or `archived_sessions` store.
 
-Simple Remote SSH authorities are discovered from the current workspace. Complex authorities and custom paths can need a one-time override. Full Remote SSH window lifecycle and multi-host acceptance remain unverified. An unidentified remote source never falls back to the local computer. Set `codexSessionNotifier.enabled=false` to stop this window's monitor.
+Plain and hex-encoded JSON Remote SSH authorities are discovered from the current workspace, including uppercase SSH aliases and explicit usernames and ports. Existing SSH configuration still supplies authentication and other connection settings. Use `sshHost` only when a host alias override is needed; it replaces the discovered connection target. Custom Codex paths can need a one-time override. An unidentified remote source never falls back to the local computer. Set `codexSessionNotifier.enabled=false` to stop this window's monitor.
 
 ## Delivery and troubleshooting
 
