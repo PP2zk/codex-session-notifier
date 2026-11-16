@@ -1,4 +1,5 @@
 import { request } from "node:https";
+import { createHmac } from "node:crypto";
 import type { HttpRequester, HttpRequestOptions, HttpResponse, PushPlusClient } from "@perk-net/perk-pushplus-sdk" with { "resolution-mode": "import" };
 import { DEFAULT_ROUTE, NotificationRoute, validateRoute } from "./channels";
 
@@ -52,6 +53,13 @@ export class PushplusSender {
   }
 
   sendTest(title: string, content = title): Promise<string> { return this.send(title, content); }
+
+  coordinationScope(sourceId: string): string {
+    // Bind the actual captured credential/recipient, without sending either to the backend.
+    return createHmac("sha256", this.token).update(JSON.stringify([
+      "codex-session-notifier/delivery/v1", sourceId, this.route.channel, this.route.option
+    ])).digest("hex");
+  }
 
   async send(title: string, content: string): Promise<string> {
     if (this.busy) throw new Error("qq_send_in_progress");

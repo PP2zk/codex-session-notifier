@@ -28,9 +28,13 @@ export class StatusUI implements vscode.Disposable {
   constructor(private store: () => StateStore, private refreshSource: () => Promise<void>) {
     this.item.name = "Codex Session Notifier";
     this.item.command = "codexSessionNotifier.openMenu";
-    // Keep the entry available while loading, without presenting guessed QQ
-    // settings or an empty session list as the first hover snapshot.
+    // VS Code installs its hover handler even when tooltip is undefined. A
+    // pointer visit before the first snapshot can then leave an empty managed
+    // hover alive; assigning the first snapshot reopens it after the pointer
+    // has left. Give the native lifecycle real content from the first show,
+    // without guessing notification settings or session activity.
     this.item.text = "$(comment-discussion) Codex";
+    this.setTooltip(insetHover("**Codex Session Notifier**\n\nLoading session status…"));
     this.item.accessibilityInformation = { label: "Codex Session Notifier: Loading status. Open menu." };
     this.item.show();
     this.timer = setInterval(() => void this.refresh(), 5000);
@@ -107,14 +111,18 @@ export class StatusUI implements vscode.Disposable {
     }
     this.rendered = true;
     if (!this.interactions && (this.item.tooltip as vscode.MarkdownString | undefined)?.value !== content) {
-      const tooltip = new vscode.MarkdownString(content, true);
-      tooltip.supportHtml = true;
-      tooltip.isTrusted = { enabledCommands: ["codexSessionNotifier.openMenu", "codexSessionNotifier.refreshStatus"] };
-      this.item.tooltip = tooltip;
+      this.setTooltip(content);
     }
     const label = this.readError ? "Codex Session Notifier: Status unavailable. Open menu." :
       `Codex Session Notifier: ${channelInfo(this.qq.route?.channel).label} ${notificationState(this.qq)}, ${count} running sessions. Open menu.`;
     if (this.item.accessibilityInformation?.label !== label) this.item.accessibilityInformation = { label };
+  }
+
+  private setTooltip(content: string): void {
+    const tooltip = new vscode.MarkdownString(content, true);
+    tooltip.supportHtml = true;
+    tooltip.isTrusted = { enabledCommands: ["codexSessionNotifier.openMenu", "codexSessionNotifier.refreshStatus"] };
+    this.item.tooltip = tooltip;
   }
 
   async showMenu(): Promise<void> {
@@ -129,13 +137,20 @@ export class StatusUI implements vscode.Disposable {
 
   async runInteraction<T>(action: () => T | PromiseLike<T>): Promise<T> {
     const first = this.interactions++ === 0;
-    if (first && !this.stopped) this.item.tooltip = undefined;
+    // Keep valid content attached: clearing it leaves an activated empty
+    // managed hover in VS Code 1.144 that later updates can reopen. Native
+    // click/focus transitions dismiss it; draw() defers content changes here.
     try {
-      // Set the return target BEFORE opening any Quick Pick/InputBox, including
-      // nested configuration steps. Closing or cancelling then returns to the
-      // editor instead of focusing the status-bar item and opening its hover.
+      // Set the return target BEFORE opening any Quick Pick/InputBox. Some
+      // editor panes (including Welcome) do not move DOM focus when asked to
+      // focus. Clear any remaining status-bar entry focus too: VS Code moves
+      // it to the bar's container, which has no hover. Otherwise Quick Input
+      // remembers the entry and reopens its hover when it restores focus.
       // Do not move focus afterwards: actions may intentionally open settings.
-      if (first) this.interactionFocus = vscode.commands.executeCommand("workbench.action.focusActiveEditorGroup");
+      if (first) this.interactionFocus = (async () => {
+        await vscode.commands.executeCommand("workbench.action.focusActiveEditorGroup");
+        await vscode.commands.executeCommand("workbench.statusBar.clearFocus");
+      })();
       await this.interactionFocus;
       return await action();
     } finally {
@@ -152,7 +167,7 @@ export class StatusUI implements vscode.Disposable {
     const channel = channelInfo(this.qq.route?.channel).label;
     const items: Array<vscode.QuickPickItem & { command?: string }> = [
       { label: this.qq.enabled && !this.qq.paused ? "$(bell-slash) Disable notifications" : this.qq.paused ? "$(bell) Resume notifications" : "$(bell) Enable notifications",
-        description: "All monitored windows on this computer",
+        description: "All sources monitored from this computer",
         detail: this.qq.enabled && !this.qq.paused ? "Stop future automatic requests. Requests already submitted may still arrive." : "Notify new reply completions; earlier completions will not be sent.",
         command: this.qq.enabled && !this.qq.paused ? "codexSessionNotifier.disableNotifications" : "codexSessionNotifier.enableNotifications" },
       ...(this.qq.paused ? [{ label: "$(bell-slash) Disable notifications", command: "codexSessionNotifier.disableNotifications" }] : []),

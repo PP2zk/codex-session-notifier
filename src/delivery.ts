@@ -28,11 +28,40 @@ export async function resolveQueued(root: string, source: Source, sourceId: stri
   return { host: data.hostname, event: { ...label, ...item, evidence: "persisted-completion" } as Completion };
 }
 
-interface Sender { send(title: string, content: string): Promise<string> }
+interface Sender { coordinationScope?(sourceId: string): string; send(title: string, content: string): Promise<string> }
+export interface DeliveryPermit { acquired: boolean; reason?: "duplicate" | "expired"; release(): Promise<void> }
+export type DeliveryGate = (sender: Sender, sourceId: string, item: QueuedCompletion, ticket: string, signal: AbortSignal) => Promise<DeliveryPermit>;
+
+export function sourceDeliveryGate(root: string, source: Source, options: ReaderOptions): DeliveryGate {
+  return async (sender, sourceId, item, ticket, signal) => {
+    const scope = sender.coordinationScope?.(sourceId);
+    if (!scope || !/^[0-9a-f]{64}$/.test(scope)) throw new Error("qq_coordination_unavailable");
+    const request = { home: options.home || undefined, sourceId, scope, ticket,
+      sessionId: item.sessionId, turnId: item.turnId, completedAt: item.completedAt };
+    try {
+      const data = await runReader(root, source, { ...request, mode: "notification_claim" }, { ...options, signal }) as
+        { schemaVersion?: number; sourceId?: string; acquired?: boolean; reason?: "duplicate" | "expired" } | null;
+      if (!data || data.schemaVersion !== 4 || data.sourceId !== sourceId || typeof data.acquired !== "boolean" ||
+          (!data.acquired && !["duplicate", "expired"].includes(data.reason || ""))) {
+        throw new Error("invalid_coordination_response");
+      }
+      return { acquired: data.acquired, reason: data.reason, release: async () => {
+        // Only called when this process knows HTTP has not started. A lost claim
+        // response or a process crash must never erase another client's record.
+        await runReader(root, source, { ...request, mode: "notification_release" }, options);
+      } };
+    } catch (error) {
+      const code = error instanceof Error && ["coordination_capacity_reached", "coordination_source_changed"].includes(error.message)
+        ? `qq_${error.message}` : "qq_coordination_unavailable";
+      throw new Error(code);
+    }
+  };
+}
 
 export class QqDelivery {
   private busy = false;
-  constructor(private store: StateStore, private sender: (route: NotificationRoute) => Promise<Sender | undefined>, private append: (line: string) => void) {}
+  constructor(private store: StateStore, private sender: (route: NotificationRoute) => Promise<Sender | undefined>, private append: (line: string) => void,
+    private gate: DeliveryGate) {}
 
   async drain(sourceId: string, host: string, events: Completion[], label: string,
     resolve: (item: QueuedCompletion) => Promise<{ host: string; event: Completion }>, signal: AbortSignal): Promise<void> {
@@ -40,6 +69,7 @@ export class QqDelivery {
     this.busy = true;
     const ticket = randomUUID();
     let claimed = false, started = false;
+    let permit: DeliveryPermit | undefined;
     let revision = 0;
     let channel = "pushplus";
     try {
@@ -56,6 +86,14 @@ export class QqDelivery {
       const current = events.find(event => event.sessionId === item.sessionId && event.turnId === item.turnId);
       const resolved = current ? { host, event: current } : await resolve(item);
       const message = qqCompletionMessage(label.trim() || resolved.host, resolved.event);
+      if (signal.aborted) return;
+      permit = await this.gate(sender, sourceId, item, ticket, signal);
+      if (!permit.acquired) {
+        await this.store.qqFinish(ticket, "suppressed", undefined, undefined, revision);
+        claimed = false;
+        this.append(`${channel}: ${permit.reason === "expired" ? "notification outside source delivery window" : "notification already claimed by another client"}`);
+        return;
+      }
       if (signal.aborted || !(await this.store.qqBegin(ticket, revision)).updated) return;
       started = true;
       const receipt = await sender.send(message.title, message.content);
@@ -70,6 +108,7 @@ export class QqDelivery {
       }
       this.append(`${channel}: ${code}`);
     } finally {
+      if (permit?.acquired && !started) await permit.release().catch(() => {});
       if (claimed) await this.store.qqFinish(ticket, started ? "unknown" : "retry", undefined, undefined, revision).catch(() => {});
       this.busy = false;
     }

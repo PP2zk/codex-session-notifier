@@ -1,6 +1,7 @@
 import { runTests } from '@vscode/test-electron';
-import { resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 
 const executable = process.env.CSN_VSCODE_EXECUTABLE;
 if (!executable || !existsSync(executable)) {
@@ -12,12 +13,40 @@ delete process.env.ELECTRON_RUN_AS_NODE;
 delete process.env.VSCODE_IPC_HOOK_CLI;
 const previewPort = process.env.CSN_UI_DEBUG_PORT;
 if (previewPort && (!/^\d{4,5}$/.test(previewPort) || Number(previewPort) > 65535)) throw new Error('Invalid isolated UI preview port');
-await runTests({
+const userData = resolve(process.env.CSN_TEST_USER_DATA_DIR || '.vscode-test/user-data');
+const options = {
   vscodeExecutablePath: executable,
   extensionDevelopmentPath: resolve(process.env.CSN_EXTENSION_DEVELOPMENT_PATH || '.'),
   extensionTestsPath: resolve('out/test/extension-host.js'),
   launchArgs: ['--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', '--disable-telemetry',
     ...(previewPort ? [`--remote-debugging-port=${previewPort}`, '--remote-debugging-address=127.0.0.1'] : []),
-    '--user-data-dir', resolve(process.env.CSN_TEST_USER_DATA_DIR || '.vscode-test/user-data'), '--extensions-dir', resolve('.vscode-test/extensions')],
-  extensionTestsEnv: { CSN_EXTENSION_TEST: '1' }
-});
+    '--user-data-dir', userData, '--extensions-dir', resolve('.vscode-test/extensions')],
+  extensionTestsEnv: { CSN_EXTENSION_TEST: '1', CSN_TEST_USER_DATA_DIR: userData }
+};
+if (process.env.CSN_TEST_UNTRUSTED === '1') {
+  // test-electron 3.1.0 always disables trust. Launch the same existing host
+  // directly for this test so its assertion exercises real Restricted Mode.
+  mkdirSync('.vscode-test', { recursive: true });
+  const root = mkdtempSync(resolve('.vscode-test/restricted-'));
+  const userData = join(root, 'user-data');
+  mkdirSync(join(userData, 'User'), { recursive: true });
+  writeFileSync(join(userData, 'User', 'settings.json'), JSON.stringify({
+    'security.workspace.trust.enabled': true,
+    'security.workspace.trust.startupPrompt': 'never'
+  }));
+  const manifest = JSON.parse(readFileSync(join(options.extensionDevelopmentPath, 'package.json'), 'utf8'));
+  const settings = Object.fromEntries(Object.keys(manifest.contributes.configuration.properties).map(id => [id,
+    id.endsWith('.enabled') ? false : id.endsWith('.sources') ? { local: { codexHome: 'workspace-must-not-select-this-home' } } : 'workspace-must-not-select-this-value']));
+  const workspace = join(root, 'restricted.code-workspace');
+  writeFileSync(workspace, JSON.stringify({ folders: [{ path: '.' }], settings }));
+  await new Promise((accept, reject) => {
+    const child = spawn(executable, [workspace, '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-telemetry',
+      '--user-data-dir', userData, '--extensions-dir', resolve('.vscode-test/extensions'),
+      `--extensionDevelopmentPath=${options.extensionDevelopmentPath}`, `--extensionTestsPath=${options.extensionTestsPath}`],
+    { stdio: 'inherit', windowsHide: true, env: { ...process.env, ...options.extensionTestsEnv, CSN_TEST_USER_DATA_DIR: userData } });
+    child.once('error', reject);
+    child.once('exit', code => code === 0 ? accept() : reject(new Error(`Restricted Mode tests exited with ${code}`)));
+  });
+} else {
+  await runTests(options);
+}

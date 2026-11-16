@@ -3,7 +3,7 @@
   "displayName": "Codex Session Notifier",
   "icon": "resources/icon.png",
   "description": "Monitor local and SSH Codex sessions and receive reply completion notifications through pushplus channels.",
-  "version": "0.0.22",
+  "version": "0.0.23",
   "license": "MIT",
   "private": true,
   "publisher": "PP2zk",
@@ -19,7 +19,7 @@
   "main": "./out/src/extension.js",
   "capabilities": {
     "untrustedWorkspaces": {
-      "supported": false
+      "supported": true
     },
     "virtualWorkspaces": {
       "supported": false
@@ -138,7 +138,7 @@
   },
   "scripts": {
     "compile": "tsc -p .",
-    "package": "npm run compile && vsce package --pre-release --githubBranch publish --out artifacts/codex-session-notifier-0.0.22.vsix",
+    "package": "npm run compile && vsce package --githubBranch publish --out artifacts/codex-session-notifier-0.0.23.vsix",
     "test": "npm run compile && node --test out/test/*.test.js && python -I -m unittest discover -s test -p test_*.py",
     "test:extension": "npm run compile && node scripts/test-extension.mjs",
     "probe": "node out/src/cli.js"

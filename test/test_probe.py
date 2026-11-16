@@ -84,6 +84,22 @@ class ProbeTests(unittest.TestCase):
         self.write([meta])
         self.assertEqual(probe.probe({"home": str(self.home)})["samples"], [])
 
+    def test_ide_desktop_sources_are_consistent_across_probe_header_and_labels(self):
+        for source in ("vscode", "appServer", "cli", "exec", "unknown", '{"subagent":{"other":"guardian"}}'):
+            with self.subTest(source=source):
+                with closing(sqlite3.connect(self.home / "state_5.sqlite")) as db:
+                    db.execute("UPDATE threads SET source=?", (source,))
+                    db.commit()
+                meta = self.metadata()
+                meta["payload"]["source"] = source
+                self.write([meta])
+                eligible = source in ("vscode", "appServer")
+                self.assertEqual(bool(probe.probe({"home": str(self.home)})["samples"]), eligible)
+                self.assertEqual(probe.valid_session_header(self.path.read_bytes(), "s1", source), eligible)
+                label = probe.labels({"home": str(self.home), "sessionIds": ["s1"]})["labels"][0]
+                self.assertEqual(label["nameState"] == "resolved", eligible)
+        self.assertFalse(probe.valid_session_header(json.dumps(self.metadata()).encode() + b"\n", "s1", "appServer"))
+
     def test_numeric_completed_at_is_interpreted_as_seconds(self):
         self.assertEqual(probe.completion_time({"completed_at": 1792390394}, {}), "2026-10-19T06:13:14Z")
         self.assertIsNone(probe.completion_time({"completed_at": "not a date"}, {}))
@@ -182,7 +198,7 @@ class ProbeTests(unittest.TestCase):
         owner = proc.stat().st_uid
         def readlink(path):
             if path == proc / "exe":
-                return "/home/test/.vscode-server/extensions/openai.chatgpt-1/bin/codex"
+                return "/opt/codex-desktop/resources/codex"
             if path == proc / "fd" / "4":
                 return str(self.path.resolve())
             raise OSError("unexpected link")
@@ -192,6 +208,9 @@ class ProbeTests(unittest.TestCase):
                 patch.object(probe, "Path", lambda value: proc_root if value == "/proc" else Path(value)), \
                 patch.object(Path, "readlink", side_effect=AttributeError("unavailable on Python 3.8")):
             self.assertTrue(probe.execution_binding(self.path))
+            (proc / "cmdline").write_bytes(b"codex\0exec\0")
+            self.assertFalse(probe.execution_binding(self.path))
+            (proc / "cmdline").write_bytes(b"codex\0app-server\0")
             system.getuid = lambda: owner + 1
             self.assertFalse(probe.execution_binding(self.path))
 
@@ -210,6 +229,73 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(detail, {"reason": reason, "osError": 5})
                 self.assertEqual(rm.RmEndSession.call_count, 0 if function == "RmStartSession" else 1)
                 kernel.OpenProcess.assert_not_called()
+
+    def test_windows_process_access_diagnostic_identifies_api_and_pid_without_paths(self):
+        for operation in ("OpenProcess", "QueryFullProcessImageNameW"):
+            with self.subTest(operation=operation):
+                rm, kernel = MagicMock(), MagicMock()
+                for name in ("RmStartSession", "RmRegisterResources", "RmEndSession"):
+                    getattr(rm, name).return_value = 0
+                def entries(_handle, _needed, count, values, _reasons):
+                    count._obj.value = 1
+                    values[0].process.pid = 4321
+                    return 0
+                rm.RmGetList.side_effect = entries
+                kernel.OpenProcess.return_value = 0 if operation == "OpenProcess" else 123
+                kernel.QueryFullProcessImageNameW.return_value = 0
+                detail = {}
+                with patch("ctypes.WinDLL", side_effect=[rm, kernel], create=True), \
+                        patch("ctypes.get_last_error", return_value=5, create=True):
+                    self.assertFalse(probe.windows_file_users(self.path, detail))
+                self.assertEqual(detail, {"reason": "process_image_failed", "osError": 5,
+                                          "operation": operation, "processId": 4321})
+                kernel.OpenProcess.assert_called_once_with(0x1000, False, 4321)
+                self.assertEqual(kernel.CloseHandle.call_count, 0 if operation == "OpenProcess" else 1)
+                rm.RmEndSession.assert_called_once()
+                self.assertNotIn(str(self.path), json.dumps(detail))
+
+    def test_windows_inaccessible_file_user_does_not_prevent_a_valid_backend_binding(self):
+        rm, kernel = MagicMock(), MagicMock()
+        for name in ("RmStartSession", "RmRegisterResources", "RmEndSession"):
+            getattr(rm, name).return_value = 0
+        def entries(_handle, _needed, count, values, _reasons):
+            count._obj.value = 2
+            values[0].process.pid, values[1].process.pid = 4, 4321
+            return 0
+        def image(_handle, _flags, buffer, _length):
+            buffer.value = r"C:\test\.vscode\extensions\openai.chatgpt-1\bin\codex.exe"
+            return 1
+        rm.RmGetList.side_effect = entries
+        kernel.OpenProcess.side_effect = [0, 123]
+        kernel.QueryFullProcessImageNameW.side_effect = image
+        with patch("ctypes.WinDLL", side_effect=[rm, kernel], create=True), \
+                patch("ctypes.get_last_error", return_value=5, create=True):
+            self.assertTrue(probe.windows_file_users(self.path, {}))
+        kernel.CloseHandle.assert_called_once_with(123)
+        rm.RmEndSession.assert_called_once()
+
+    def test_windows_file_binding_accepts_desktop_backends_but_not_other_file_users(self):
+        for image_path, expected in [(r"C:\Users\test\AppData\Local\OpenAI\Codex\bin\build\codex.exe", True),
+                                     (r"C:\Program Files\WindowsApps\OpenAI.Codex\app\resources\codex.exe", True),
+                                     (r"C:\custom-ide\bin\codex.exe", True),
+                                     (r"C:\other\not-codex.exe", False)]:
+            with self.subTest(image=image_path):
+                rm, kernel = MagicMock(), MagicMock()
+                for name in ("RmStartSession", "RmRegisterResources", "RmEndSession"):
+                    getattr(rm, name).return_value = 0
+                def entries(_handle, _needed, count, values, _reasons):
+                    count._obj.value = 1
+                    values[0].process.pid = 123
+                    return 0
+                def image(_handle, _flags, buffer, _length):
+                    buffer.value = image_path
+                    return 1
+                rm.RmGetList.side_effect = entries
+                kernel.OpenProcess.return_value = 1
+                kernel.QueryFullProcessImageNameW.side_effect = image
+                with patch("ctypes.WinDLL", side_effect=[rm, kernel], create=True):
+                    self.assertEqual(probe.windows_file_users(self.path), expected)
+                kernel.CloseHandle.assert_called_once()
 
     def test_runtime_readers_keep_python_37_compatible_syntax(self):
         for name in ("probe.py", "state.py"):

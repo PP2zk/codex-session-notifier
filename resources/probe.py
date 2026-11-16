@@ -1,4 +1,4 @@
-"""Bounded read-only Codex metadata probe. Uses existing Python; no installs.
+"""Bounded Codex reader and notifier-owned delivery claims; no installs.
 
 The same source can execute locally or through SSH without creating a remote
 script. Never return prompt text, assistant text, instructions or raw records.
@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import sqlite3
 import sys
 import time
@@ -23,6 +24,10 @@ MAX_HEADER = 131072
 MAX_OUTPUT = 524288
 MAX_SCAN_BYTES = 1048576
 MAX_CATCHUP_BYTES = 8388608
+# App Server is the common backend for IDE and Desktop clients. Terminal CLI
+# and exec sessions, unknown sources and structured subagent sources stay out.
+CLIENT_SOURCES = ("vscode", "appServer")
+CLIENT_SOURCE_SQL = "source IN (" + ",".join("?" for _ in CLIENT_SOURCES) + ")"
 
 
 def comparison_path(path):
@@ -55,7 +60,7 @@ def completion_time(payload, item):
     return None
 
 
-def valid_session_header(raw, session_id):
+def valid_session_header(raw, session_id, source=None):
     """Identify the record format by its data, never by a CLI version string."""
     if len(raw) > MAX_HEADER or not raw.endswith(b"\n"):
         return False
@@ -63,7 +68,8 @@ def valid_session_header(raw, session_id):
         item = json.loads(raw)
         payload = item.get("payload") if isinstance(item, dict) else None
         return (item.get("type") == "session_meta" and isinstance(payload, dict)
-                and payload.get("id") == session_id and payload.get("source") == "vscode")
+                and payload.get("id") == session_id and payload.get("source") in CLIENT_SOURCES
+                and (source is None or payload.get("source") == source))
     except (ValueError, TypeError, AttributeError):
         return False
 
@@ -225,8 +231,8 @@ def probe(request):
         if session_name is not None and not label_columns:
             result["warnings"].append("name_filter_unsupported")
             return result
-        query = "SELECT " + ",".join(selected) + " FROM threads WHERE source=?"
-        params = ["vscode"]
+        query = "SELECT " + ",".join(selected) + " FROM threads WHERE " + CLIENT_SOURCE_SQL
+        params = list(CLIENT_SOURCES)
         if session_name is not None:
             labels = ["NULLIF(TRIM(" + key + "),'')" for key in label_columns]
             label_sql = "COALESCE(" + ",".join(labels) + ")" if len(labels) > 1 else labels[0]
@@ -250,14 +256,14 @@ def probe(request):
             result["warnings"].append("rollout_outside_sessions")
             continue
         label, label_source = session_label(row)
-        sample = {"sessionId": session_id, "source": "vscode",
+        sample = {"sessionId": session_id, "source": row["source"],
                   "archived": bool(row.get("archived")),
                   "hasName": label is not None, "nameSource": label_source,
                   "cliVersion": row.get("cli_version"), "fileExists": path.is_file()}
         if path.is_file():
             try:
                 meta = header_metadata(path)
-                if not meta or meta.get("id") != session_id or meta.get("source") != "vscode":
+                if not meta or meta.get("id") != session_id or meta.get("source") != row["source"]:
                     result["warnings"].append("session_metadata_mismatch")
                     continue
                 sample["metadata"] = meta
@@ -335,16 +341,20 @@ def windows_file_users(path, diagnostic=None):
             process = kernel.OpenProcess(0x1000, False, info.process.pid)
             if not process:
                 if diagnostic is not None:
-                    diagnostic.update(reason="process_image_failed", osError=c.get_last_error())
+                    diagnostic.update(reason="process_image_failed", osError=c.get_last_error(),
+                                      operation="OpenProcess", processId=info.process.pid)
                 continue
             try:
                 image, length = c.create_unicode_buffer(4096), w.DWORD(4096)
                 if kernel.QueryFullProcessImageNameW(process, 0, image, c.byref(length)):
                     value = image.value.replace("\\", "/").lower()
-                    if value.endswith("/codex.exe") and "/extensions/openai.chatgpt-" in value:
+                    # Desktop and configured IDE backends need not live inside
+                    # a VS Code extension. RM still ties this image to this file.
+                    if value.endswith("/codex.exe"):
                         return True
                 elif diagnostic is not None:
-                    diagnostic.update(reason="process_image_failed", osError=c.get_last_error())
+                    diagnostic.update(reason="process_image_failed", osError=c.get_last_error(),
+                                      operation="QueryFullProcessImageNameW", processId=info.process.pid)
             finally:
                 kernel.CloseHandle(process)
         return False
@@ -377,7 +387,7 @@ def execution_binding(path, diagnostic=None):
                 with (proc / "cmdline").open("rb") as stream:
                     command = stream.read(4096).split(b"\0")
                 image = os.readlink(proc / "exe")
-                if b"app-server" not in command or "/extensions/openai.chatgpt-" not in image:
+                if b"app-server" not in command or Path(image).name != "codex":
                     continue
                 candidates += 1
                 if candidates > 8:
@@ -406,26 +416,45 @@ def execution_binding(path, diagnostic=None):
     return False
 
 
+def checkpoint_bytes(path, offset):
+    with path.open("rb") as stream:
+        stream.seek(max(0, offset - 64))
+        return stream.read(min(64, offset))
+
+
 def collect_activity(rows, home, result, previous, budget, record_budget):
     """Activity advances before completion replay, with its own persisted offsets."""
     running, unknown, binding_checks = [], 0, 0
+    diagnostics = []
     backlog = False
     progress = {}
     candidate_budget = 16
     session_root = comparison_path(home / "sessions")
 
-    def window(path, end):
+    def save_activity_anchor(path, cursor, offset):
+        nonlocal budget
+        if offset is not None and budget >= 64:
+            anchor = checkpoint_bytes(path, offset)
+            budget -= len(anchor)
+            result["bytesRead"] += len(anchor)
+            cursor.update(activityOffset=offset, activityAnchor=hashlib.sha256(anchor).hexdigest())
+
+    def window(path, end, file_size, row, since=None):
         nonlocal budget, record_budget, candidate_budget
-        cap = min(MAX_TAIL, budget, end)
+        cap = min(MAX_TAIL, max(0, budget - (64 if end == file_size else 0)), end)
         if cap <= 0 or record_budget <= 0 or candidate_budget <= 0:
-            return None, end
+            return None, end, False, None
         start = end - cap
+        if since is not None:
+            start = max(start, since)
+            cap = end - start
         with path.open("rb") as stream:
             stream.seek(start)
             raw = stream.read(cap)
         budget -= len(raw)
         result["bytesRead"] += len(raw)
-        if start:
+        read_offset = start + raw.rfind(b"\n") + 1 if b"\n" in raw else None
+        if start and start != since:
             boundary = raw.find(b"\n")
             if 0 <= boundary < len(raw) - 1:
                 start += boundary + 1
@@ -445,19 +474,48 @@ def collect_activity(rows, home, result, previous, budget, record_budget):
                     result["warnings"].extend(parsed["warnings"])
                     # A malformed latest lifecycle record cannot expose an
                     # older task_started as if it still described this turn.
-                    return parsed["state"], start if parsed["state"]["activityKnown"] else 0
+                    return {**parsed["state"], "activityInitializationOnly": False}, start if parsed["state"]["activityKnown"] else 0, False, read_offset
             except (ValueError, TypeError, AttributeError):
                 pass
             if record_budget <= 0 or candidate_budget <= 0:
                 # Keep the unexamined older portion for a later scan.
-                return None, end - (len(raw) - raw.find(line))
-        return None, start
+                return None, end - (len(raw) - raw.find(line)), False, read_offset
+        complete_file = start == 0 and end == file_size and len(raw) == file_size
+        init_checked = complete_file and not raw.endswith(b"\n")
+        if complete_file and raw.endswith(b"\n"):
+            # A complete small file containing only initialization has never
+            # begun a turn. Unknown or malformed execution records stay unknown.
+            initial_lines = raw.splitlines(keepends=True)
+            if 0 < len(initial_lines) <= min(record_budget, candidate_budget):
+                init_checked = True
+                initialization_only = True
+                for line in initial_lines:
+                    record_budget -= 1
+                    candidate_budget -= 1
+                    try:
+                        item = json.loads(line)
+                        payload = item.get("payload", {})
+                        if not (item.get("type") == "session_meta" and valid_session_header(line, row["id"], row["source"]) or
+                                item.get("type") == "event_msg" and isinstance(payload, dict) and
+                                payload.get("type") == "thread_settings_applied"):
+                            initialization_only = False
+                            break
+                    except (ValueError, TypeError, AttributeError):
+                        initialization_only = False
+                        break
+                if initialization_only:
+                    return {"activeTurn": None, "activeStartedAt": None, "activityKnown": True,
+                            "activityInitializationOnly": True}, 0, True, read_offset
+        return None, start, init_checked, read_offset
 
     sequence = max((p.get("activityOrder", 0) for p in previous.values()), default=0)
     order = sorted(rows, key=lambda r: (previous.get(r["id"], {}).get("activityOrder", 0), -r.get("updated_at", 0)))
     for row in order:
         sid = row["id"]
         cursor = None
+        stat = None
+        state, reason = "unknown", "file_unavailable"
+        binding_diagnostic = {}
         before_budget, before_bindings = budget, binding_checks
         try:
             path = Path(row["rollout_path"]).resolve(strict=True)
@@ -469,8 +527,9 @@ def collect_activity(rows, home, result, previous, budget, record_budget):
             if new_file:
                 cursor = {"fileKey": key, "observedSize": 0, "activityLookback": stat.st_size, "activityKnown": False}
             progress[sid] = cursor
-            if not cursor.get("activityHeaderVerified"):
+            if not cursor.get("activityHeaderVerified") or cursor.get("activityHeaderSource") != row["source"]:
                 if budget < MAX_HEADER + 1:
+                    reason = "read_budget_exhausted"
                     backlog = True
                     unknown += 1
                     continue
@@ -478,57 +537,105 @@ def collect_activity(rows, home, result, previous, budget, record_budget):
                     header = stream.readline(MAX_HEADER + 1)
                 budget -= len(header)
                 result["bytesRead"] += len(header)
-                if not valid_session_header(header, sid):
+                if not valid_session_header(header, sid, row["source"]):
+                    reason = "metadata_mismatch"
                     result["warnings"].append("session_metadata_mismatch")
                     unknown += 1
                     continue
                 cursor["activityHeaderVerified"] = True
+                cursor["activityHeaderSource"] = row["source"]
             delta = stat.st_size - cursor.get("observedSize", 0)
-            if delta > 0 and budget > 0 and record_budget > 0 and candidate_budget > 0:
-                parsed, next_end = window(path, stat.st_size)
+            since = None
+            offset = cursor.get("activityOffset")
+            if cursor.get("activityKnown") and isinstance(offset, int) and 0 <= offset <= stat.st_size and isinstance(cursor.get("activityAnchor"), str):
+                if budget < 128:
+                    reason = "read_budget_exhausted"
+                    unknown += 1
+                    continue
+                anchor = checkpoint_bytes(path, offset)
+                budget -= len(anchor)
+                result["bytesRead"] += len(anchor)
+                if hashlib.sha256(anchor).hexdigest() == cursor["activityAnchor"]:
+                    since = offset
+                else:
+                    cursor.update(activityKnown=False, activityInitializationOnly=False,
+                                  activityLookback=stat.st_size)
+            if delta > 0:
+                cursor["activityInitChecked"] = False
+                if cursor.get("activityInitializationOnly"):
+                    # Initialization establishes idle only for those exact
+                    # bytes. Any append must supply fresh lifecycle evidence.
+                    cursor.update(activityKnown=False, activityInitializationOnly=False,
+                                  activityLookback=stat.st_size)
+            check_initialization = (not cursor.get("activityKnown") and not cursor.get("activityLookback", 0)
+                                    and not cursor.get("activityInitChecked") and stat.st_size <= MAX_TAIL)
+            if (delta > 0 or check_initialization) and budget > 0 and record_budget > 0 and candidate_budget > 0:
+                parsed, next_end, init_checked, read_offset = window(path, stat.st_size, stat.st_size, row, since)
                 cursor["observedSize"] = stat.st_size
+                save_activity_anchor(path, cursor, read_offset)
+                if init_checked:
+                    cursor["activityInitChecked"] = True
                 if parsed:
-                    cursor.update({k: parsed[k] for k in ("activeTurn", "activeStartedAt", "activityKnown")})
+                    cursor.update({k: parsed[k] for k in ("activeTurn", "activeStartedAt", "activityKnown", "activityInitializationOnly")})
                     cursor["activityLookback"] = next_end
-                elif new_file or delta > MAX_TAIL:
+                elif new_file or delta > MAX_TAIL or since is not None and next_end > since:
                     cursor["activityKnown"] = False
                     cursor["activityLookback"] = next_end
             while not cursor.get("activityKnown") and cursor.get("activityLookback", 0) > 0 and budget > 0 and candidate_budget > 0:
                 end = cursor["activityLookback"]
-                parsed, next_end = window(path, end)
+                parsed, next_end, init_checked, read_offset = window(path, end, stat.st_size, row)
+                if end == stat.st_size:
+                    save_activity_anchor(path, cursor, read_offset)
+                if init_checked:
+                    cursor["activityInitChecked"] = True
                 if next_end >= end:
                     break
                 cursor["activityLookback"] = next_end
                 if parsed:
-                    cursor.update({k: parsed[k] for k in ("activeTurn", "activeStartedAt", "activityKnown")})
+                    cursor.update({k: parsed[k] for k in ("activeTurn", "activeStartedAt", "activityKnown", "activityInitializationOnly")})
             if not cursor.get("activityKnown"):
                 backlog |= cursor.get("activityLookback", 0) > 0
+                reason = "activity_backfill" if cursor.get("activityLookback", 0) > 0 else "lifecycle_unknown"
                 unknown += 1
                 continue
             if cursor.get("observedSize", 0) != stat.st_size:
+                reason = "read_budget_exhausted" if budget < MAX_HEADER + 1 else "record_budget_exhausted" if record_budget <= 0 or candidate_budget <= 0 else "unread_changes"
                 unknown += 1
                 continue
             if not cursor.get("activeTurn"):
+                state, reason = "idle", "initialization_only" if cursor.get("activityInitializationOnly") else "task_ended"
                 continue
             if time.time() - cursor.get("activityCheckedAt", 0) >= 10 and binding_checks < 4:
-                cursor["activityBound"] = execution_binding(path)
+                cursor["activityBound"] = execution_binding(path, binding_diagnostic)
+                if cursor["activityBound"]:
+                    binding_diagnostic.clear()
                 cursor["activityCheckedAt"] = time.time()
                 binding_checks += 1
             if not cursor.get("activityBound") or time.time() - cursor.get("activityCheckedAt", 0) > 30:
+                reason = "binding_unverified" if not cursor.get("activityBound") else "binding_stale"
                 unknown += 1
                 continue
             name, _ = session_label(row)
             running.append({"sessionId": sid, "turnId": cursor["activeTurn"], "sessionName": name,
                             "nameState": "resolved" if name else "unset" if any(k in row for k in ("name", "title")) else "unavailable",
                             "startedAt": cursor.get("activeStartedAt")})
+            state, reason = "running", "task_started"
         except (OSError, ValueError, TypeError, AttributeError):
             unknown += 1
         finally:
+            if isinstance(sid, str) and 0 < len(sid) <= 128:
+                name, _ = session_label(row)
+                diagnostics.append({"kind": "activity", "sessionId": sid, "sessionName": name[:96] if name else None,
+                    "turnId": cursor.get("activeTurn") if cursor else None, "state": state, "reason": reason,
+                    "fileBytes": stat.st_size if stat else 0, "observedBytes": cursor.get("observedSize", 0) if cursor else 0,
+                    "lookbackBytes": cursor.get("activityLookback", 0) if cursor else 0,
+                    **({"bindingReason": binding_diagnostic["reason"]} if "reason" in binding_diagnostic else {}),
+                    **{k: binding_diagnostic[k] for k in ("osError", "processId", "operation") if k in binding_diagnostic}})
             if cursor is not None and (budget < before_budget or binding_checks > before_bindings):
                 sequence += 1
                 cursor["activityOrder"] = sequence
     result.update({"activeSessions": running, "activityUnknown": unknown, "activity": progress,
-                   "activityBacklog": backlog})
+                   "activityBacklog": backlog, "diagnostics": diagnostics})
     return record_budget
 
 
@@ -549,14 +656,15 @@ def scan(request):
     started = request.get("startedAt", time.time())
     position = request.get("position", 0)
     initialized = request.get("initialized", False)
+    notification_backlog = request.get("notificationBacklog", False)
     if not isinstance(started, (int, float)) or isinstance(started, bool) or not 0 < started <= time.time() + 300:
         raise ValueError("invalid_started_time")
-    if not isinstance(position, int) or isinstance(position, bool) or not 0 <= position <= 128 or not isinstance(initialized, bool):
+    if not isinstance(position, int) or isinstance(position, bool) or not 0 <= position <= 128 or not isinstance(initialized, bool) or not isinstance(notification_backlog, bool):
         raise ValueError("invalid_scan_state")
     result = {"schemaVersion": 2, "sourceId": source_identity(home), "hostname": platform.node(),
               "observedAt": datetime.now(timezone.utc).isoformat(), "initialized": True,
               "cursors": {}, "position": 0, "events": [], "warnings": [], "bytesRead": 0,
-              "verificationFailures": []}
+              "verificationFailures": [], "notificationBacklog": False}
     database = home / "state_5.sqlite"
     if not database.is_file():
         raise ValueError("database_missing")
@@ -565,10 +673,10 @@ def scan(request):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
         if not {"id", "source", "rollout_path", "updated_at"}.issubset(columns):
             raise ValueError("unsupported_database_schema")
-        selected = ["id", "rollout_path", "updated_at"] + [k for k in ("name", "title", "archived") if k in columns]
+        selected = ["id", "source", "rollout_path", "updated_at"] + [k for k in ("name", "title", "archived") if k in columns]
         active = "(archived=0 OR archived IS NULL)" if "archived" in columns else "1=1"
-        query = "SELECT " + ",".join(selected) + " FROM threads WHERE source=? AND ((" + active + " AND updated_at>=?)"
-        params = ["vscode", int(time.time()) - 2100]
+        query = "SELECT " + ",".join(selected) + " FROM threads WHERE " + CLIENT_SOURCE_SQL + " AND ((" + active + " AND updated_at>=?)"
+        params = [*CLIENT_SOURCES, int(time.time()) - 2100]
         if cursors:
             query += " OR id IN (" + ",".join("?" for _ in cursors) + ")"
             params.extend(cursors)
@@ -580,10 +688,10 @@ def scan(request):
     if not isinstance(previous_activity, dict) or len(previous_activity) > 128 or any(not isinstance(v, dict) for v in previous_activity.values()):
         raise ValueError("invalid_activity_state")
     # Initial discovery can need tens of MiB before the last lifecycle record.
-    # Read larger bounded batches only while that reverse search is unfinished;
-    # steady-state polls retain their original budget. Always reserve 512 KiB
+    # Read larger bounded batches for unfinished reverse discovery or advancing
+    # notification replay; steady polls retain their budget. Reserve 512 KiB
     # for notification replay, and retain the per-session fair ordering above.
-    catchup = any(row["id"] not in previous_activity or
+    catchup = notification_backlog or any(row["id"] not in previous_activity or
                   (not previous_activity[row["id"]].get("activityKnown") and
                    previous_activity[row["id"]].get("activityLookback", 0) > 0)
                   for row in rows)
@@ -591,21 +699,21 @@ def scan(request):
     record_budget = collect_activity([row for row in rows if not row.get("archived")], home, result,
                                     previous_activity, scan_budget - 524288, 100)
     budget = scan_budget - result["bytesRead"]
+    forward_progress, forward_pending = False, False
+    if rows:
+        position %= len(rows)
+    next_position = position
 
     def save_anchor(path, cursor):
         nonlocal budget
-        with path.open("rb") as stream:
-            stream.seek(max(0, cursor["offset"] - 64))
-            anchor = stream.read(min(64, cursor["offset"]))
+        anchor = checkpoint_bytes(path, cursor["offset"])
         cursor["anchor"] = hashlib.sha256(anchor).hexdigest()
         budget -= len(anchor)
         result["bytesRead"] += len(anchor)
         return anchor
 
     rows = rows[position:] + rows[:position]
-    processed = 0
-    for row in rows:
-        processed += 1
+    for index, row in enumerate(rows):
         sid = row["id"]
         if not isinstance(sid, str) or not 1 <= len(sid) <= 128:
             result["warnings"].append("invalid_session_identity")
@@ -628,6 +736,7 @@ def scan(request):
             if budget < 64:
                 result["cursors"][sid] = previous
                 result["warnings"].append("read_backlog")
+                forward_pending |= previous["offset"] < stat.st_size
                 continue
             checkpoint = dict(previous)
             save_anchor(path, checkpoint)
@@ -653,12 +762,13 @@ def scan(request):
             else:
                 result["cursors"].pop(sid, None)
             result["warnings"].append("read_backlog")
+            forward_pending = True
             continue
         with path.open("rb") as stream:
             header = stream.readline(MAX_HEADER + 1)
         budget -= len(header)
         result["bytesRead"] += len(header)
-        if not valid_session_header(header, sid):
+        if not valid_session_header(header, sid, row["source"]):
             result["warnings"].append("session_metadata_mismatch")
             result["cursors"].pop(sid, None)
             continue
@@ -667,17 +777,24 @@ def scan(request):
             cursor["skipping"] = cursor["offset"] > len(header)
             if previous and not row.get("archived"):
                 result["warnings"].append("session_file_rebased")
-        cap = min(MAX_TAIL, budget - 64)
+        cap = min(MAX_CATCHUP_BYTES if notification_backlog else MAX_TAIL, budget - 64)
+        before_offset = cursor["offset"]
         with path.open("rb") as stream:
             stream.seek(cursor["offset"])
             raw = stream.read(cap)
         budget -= len(raw)
         result["bytesRead"] += len(raw)
+        if raw:
+            # Resume after the last file actually served. A fixed stride can
+            # starve peers when one large file consumes a whole catchup batch.
+            next_position = (position + index + 1) % len(rows)
         if cursor.get("skipping"):
             newline = raw.find(b"\n")
             if newline < 0:
                 cursor["offset"] += len(raw)
                 save_anchor(path, cursor)
+                forward_progress |= cursor["offset"] > before_offset
+                forward_pending |= cursor["offset"] < stat.st_size
                 continue
             cursor["offset"] += newline + 1
             raw = raw[newline + 1:]
@@ -687,22 +804,34 @@ def scan(request):
         cursor["offset"] += parsed["consumed"]
         cursor["parser"] = parsed["state"]
         record_budget -= parsed["records"]
-        if not parsed["consumed"] and len(raw) == cap and cap == MAX_TAIL:
+        if not parsed["consumed"] and len(raw) == cap and cap >= MAX_TAIL and before_offset + cap < stat.st_size:
             cursor["offset"] += len(raw)
             cursor["skipping"] = True
             result["warnings"].append("oversized_record_skipped")
         candidates = []
         for event in parsed["completions"]:
             completed = event["completedAt"]
+            decision = "eligible"
             if completed is None:
                 result["warnings"].append("completion_time_unavailable")
-                continue
-            timestamp = datetime.fromisoformat(completed.replace("Z", "+00:00")).timestamp()
+                decision = "time_unavailable"
+            else:
+                timestamp = datetime.fromisoformat(completed.replace("Z", "+00:00")).timestamp()
+                if (sid, event["turnId"]) in known:
+                    decision = "already_queued"
+                elif timestamp < max(started, time.time() - 1800):
+                    decision = "before_monitor_start" if timestamp < started else "expired"
+                elif timestamp > time.time() + 60:
+                    decision = "future_time"
+            name, _ = session_label(row)
+            result["diagnostics"].append({"kind": "completion", "sessionId": sid, "sessionName": name[:96] if name else None,
+                "turnId": event["turnId"], "completedAt": completed, "state": "observed", "reason": decision,
+                "offset": cursor["offset"], "fileBytes": stat.st_size})
             # Local outbox identities have already passed source verification.
             # A native archive move can replay those bytes after the writer has
             # closed the file. Skip only exact known session/turn pairs; this
             # never supplies provenance for a new completion in the same file.
-            if (sid, event["turnId"]) not in known and max(started, time.time() - 1800) <= timestamp <= time.time() + 60:
+            if decision == "eligible":
                 candidates.append(event)
         if candidates:
             diagnostic = {"reason": "backend_not_observed"}
@@ -711,6 +840,9 @@ def scan(request):
                 name, _ = session_label(row)
                 result["verificationFailures"].append({"sessionId": sid, "sessionName": name[:256] if name else None,
                     "turnIds": [event["turnId"] for event in candidates], **diagnostic})
+                for item in result["diagnostics"]:
+                    if item["kind"] == "completion" and item["sessionId"] == sid and item["reason"] == "eligible":
+                        item.update(state="withheld", reason="source_unverified", bindingReason=diagnostic["reason"])
                 # Retry the same bytes; do not silently lose a fresh completion.
                 if previous:
                     result["cursors"][sid] = previous
@@ -718,16 +850,31 @@ def scan(request):
                     result["cursors"].pop(sid, None)
                 continue
             name, name_source = session_label(row)
+            for item in result["diagnostics"]:
+                if item["kind"] == "completion" and item["sessionId"] == sid and item["reason"] == "eligible":
+                    item.update(state="verified", reason="new_completion")
             name_state = "resolved" if name else "unset" if any(k in row for k in ("name", "title")) else "unavailable"
             for event in candidates:
                 result["events"].append({"sessionId": sid, "sessionName": name,
                                          "nameState": name_state, "nameSource": name_source,
                                          "evidence": "persisted-completion", **event})
         save_anchor(path, cursor)
+        forward_progress |= cursor["offset"] > before_offset
+        forward_pending |= cursor["offset"] < stat.st_size
         if row.get("archived") and cursor["offset"] == stat.st_size:
             result["cursors"].pop(sid, None)
     if rows:
-        result["position"] = (position + min(4, processed)) % len(rows)
+        result["position"] = next_position
+    result["notificationBacklog"] = forward_progress and forward_pending
+    if result["notificationBacklog"]:
+        result["warnings"].append("read_backlog")
+    for diagnostic in result["diagnostics"]:
+        cursor = result["cursors"].get(diagnostic["sessionId"], {})
+        diagnostic.setdefault("offset", cursor.get("offset", 0))
+    result["diagnostics"].append({"kind": "scan", "sessionId": "", "turnId": None,
+        "state": "ok", "reason": "read_backlog" if "read_backlog" in result["warnings"] else "scan_complete",
+        "bytesRead": result["bytesRead"], "runningCount": len(result["activeSessions"]),
+        "unknownCount": result["activityUnknown"], "position": result["position"]})
     result["warnings"] = sorted(set(result["warnings"]))
     return result
 
@@ -749,13 +896,68 @@ def labels(request):
         if not {"id", "source"}.issubset(columns):
             raise ValueError("unsupported_database_schema")
         selected = ["id"] + [k for k in ("name", "title") if k in columns]
-        query = "SELECT " + ",".join(selected) + " FROM threads WHERE source=? AND id IN (" + ",".join("?" for _ in ids) + ") LIMIT 10"
-        found = {row[0]: dict(zip(selected, row)) for row in conn.execute(query, ["vscode", *ids])}
+        query = "SELECT " + ",".join(selected) + " FROM threads WHERE " + CLIENT_SOURCE_SQL + " AND id IN (" + ",".join("?" for _ in ids) + ") LIMIT 10"
+        found = {row[0]: dict(zip(selected, row)) for row in conn.execute(query, [*CLIENT_SOURCES, *ids])}
     for sid in ids:
         row = found.get(sid, {})
         name, name_source = session_label(row)
         result["labels"].append({"sessionId": sid, "sessionName": name, "nameSource": name_source,
                                  "nameState": "resolved" if name else "unset" if any(k in row for k in ("name", "title")) else "unavailable"})
+    return result
+
+
+def notification_claim(request):
+    """Serialize attempts on the source machine, never modify Codex data.
+
+    A successful claim is durable before HTTP. It does not expire into a new
+    sender: retention exceeds event eligibility, including future tolerance.
+    Only an owner that knows HTTP never started may explicitly release it.
+    """
+    home = Path(request.get("home") or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+    source = source_identity(home)
+    if request.get("sourceId") != source:
+        raise ValueError("coordination_source_changed")
+    scope, ticket = request.get("scope"), request.get("ticket")
+    if not isinstance(scope, str) or not re.fullmatch(r"[0-9a-f]{64}", scope) or not isinstance(ticket, str) or not re.fullmatch(r"[0-9a-f-]{36}", ticket):
+        raise ValueError("invalid_coordination_request")
+    ids = [request.get("sessionId"), request.get("turnId")]
+    if any(not isinstance(value, str) or not 1 <= len(value) <= 128 for value in ids):
+        raise ValueError("invalid_coordination_request")
+    completed = request.get("completedAt")
+    if not isinstance(completed, str) or len(completed) > 128:
+        raise ValueError("invalid_coordination_request")
+    parsed = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("invalid_coordination_request")
+    now = time.time()
+    result = {"schemaVersion": 4, "sourceId": source, "acquired": False}
+    if not now - 1800 <= parsed.timestamp() <= now + 60:
+        return dict(result, reason="expired")
+    key = hashlib.sha256(json.dumps([source, scope] + ids, separators=(",", ":")).encode()).hexdigest()
+    # Fixed user-owned path, shared by local and SSH execution under this user.
+    # Do not put this in CODEX_HOME, a workspace, or a client-supplied path.
+    directory = Path.home() / ".codex-session-notifier"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    database = directory / "delivery-v1.sqlite"
+    descriptor = os.open(str(database), os.O_CREAT | os.O_RDWR, 0o600)
+    os.close(descriptor)
+    with closing(sqlite3.connect(str(database), timeout=2)) as conn:
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        conn.execute("PRAGMA max_page_count=%d" % (16777216 // page_size))
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE IF NOT EXISTS claims(event_key TEXT PRIMARY KEY, ticket TEXT NOT NULL, claimed_at REAL NOT NULL)")
+        conn.execute("CREATE INDEX IF NOT EXISTS claims_age ON claims(claimed_at)")
+        conn.execute("DELETE FROM claims WHERE claimed_at<?", (now - 86400,))
+        if request["mode"] == "notification_release":
+            conn.execute("DELETE FROM claims WHERE event_key=? AND ticket=?", (key, ticket))
+        elif conn.execute("SELECT 1 FROM claims WHERE event_key=?", (key,)).fetchone():
+            result["reason"] = "duplicate"
+        else:
+            if conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] >= 10000:
+                raise ValueError("coordination_capacity_reached")
+            conn.execute("INSERT INTO claims VALUES(?,?,?)", (key, ticket, now))
+            result["acquired"] = True
+        conn.commit()
     return result
 
 
@@ -768,7 +970,7 @@ def main():
         if not isinstance(request, dict):
             raise ValueError("invalid_request")
         mode = request.get("mode")
-        response = scan(request) if mode == "scan" else labels(request) if mode == "labels" else probe(request)
+        response = notification_claim(request) if mode in ("notification_claim", "notification_release") else scan(request) if mode == "scan" else labels(request) if mode == "labels" else probe(request)
         encoded = json.dumps(response, ensure_ascii=True)
         if len(encoded.encode("utf-8")) > MAX_OUTPUT:
             raise ValueError("output_budget_exceeded")
@@ -776,7 +978,8 @@ def main():
     except (OSError, sqlite3.Error, ValueError, TypeError) as error:
         # Error text could contain paths or raw data, so return a code only.
         code = str(error) if isinstance(error, ValueError) and str(error) in (
-            "database_missing", "unsupported_database_schema", "machine_identity_unavailable") else "probe_failed"
+            "database_missing", "unsupported_database_schema", "machine_identity_unavailable",
+            "coordination_capacity_reached", "coordination_source_changed") else "probe_failed"
         print(json.dumps({"error": code}))
         return 1
     return 0

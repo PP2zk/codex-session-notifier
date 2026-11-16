@@ -2,12 +2,14 @@
 
 [![VS Marketplace](https://img.shields.io/badge/VS%20Marketplace-Install-007ACC?style=flat-square)](https://marketplace.visualstudio.com/items?itemName=pp2zk.codex-session-notifier)
 [![GitHub issues](https://img.shields.io/github/issues/PP2zk/codex-session-notifier?style=flat-square&label=issues)](https://github.com/PP2zk/codex-session-notifier/issues)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE.txt)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](https://github.com/PP2zk/codex-session-notifier/blob/publish/LICENSE.txt)
 
-Monitor VS Code Codex sessions locally and on Remote SSH hosts. Receive a pushplus notification through your chosen channel when a reply finishes, with the actual machine and session name in its details.
+Monitor Codex IDE and Desktop sessions locally and on Remote SSH hosts. Receive a pushplus notification through your chosen channel when a reply finishes, with the actual machine and session name in its details.
+
+VS Code hosts the notifier and discovers the local or connected Remote SSH machine. Sessions can run in the Codex IDE extension or Codex Desktop on that machine, using the configured Codex data directory. Terminal CLI and `codex exec` sessions are excluded. Both activity and completion checks require the matching session metadata and an existing Codex backend associated with its log. Keep a VS Code window connected to each machine you want to monitor; closing every relevant window stops monitoring. A Desktop-specific `CODEX_HOME` can require a one-time source override.
 
 <p align="center">
-  <img src="docs/images/overview.png" alt="Example of the notifier hover and status bar, showing fictional devices and sessions" width="560">
+  <img src="https://github.com/PP2zk/codex-session-notifier/raw/publish/docs/images/overview.png" alt="Example of the notifier hover and status bar, showing fictional devices and sessions" width="560">
 </p>
 
 ## Status bar
@@ -20,13 +22,17 @@ Headings, status paragraphs, and footer links share a text inset; lists retain n
 
 Activity already in progress at startup is discovered through bounded backward reads. Until its start marker or backend can be verified, it appears as an activity check rather than an invented running session. Sources without an update for 30 seconds are marked delayed and excluded from the running count. Local UI snapshots expire after 90 seconds; they contain names and IDs, never prompts, replies, or tokens. The notification outbox continues to store IDs and delivery metadata only.
 
+After discovery, activity reads continue from the last complete record with a content checkpoint. Small updates in several sessions share the normal read budget. A complete small log containing only initialization records is idle until a turn starts.
+
+Choose **Show logs** to see timestamped activity transitions, reasons for unconfirmed activity, read positions, and completion decisions. Recent diagnostic history survives window reloads in local extension storage, with a seven-day and 4,096-entry limit; the command loads the latest 100 entries. Scan heartbeats are recorded at most once per minute and unchanged session states at most once every five minutes. Diagnostics contain session names, IDs and technical metadata, without prompts, replies, file paths or tokens.
+
 Archived history is excluded from new activity candidates. A session already being monitored can have its final records checked in the native archive directory before its read cursor is retired; the existing completion evidence, backend verification, recovery window, and deduplication rules still apply. Archiving alone is not a completion signal.
 
-An archive move can cause records to be read again after the backend closes the file. Already queued replies are recognized by the exact source, session, and turn IDs in the existing local outbox, before attempting source verification again. This prevents a misleading warning about a notification already processed. Unseen turns still require backend verification, including new turns in a file containing previously queued replies. No additional remote state or service is installed.
+An archive move can cause records to be read again after the backend closes the file. Already queued replies are recognized by the exact source, session, and turn IDs in the existing local outbox, before attempting source verification again. This prevents a misleading warning about a notification already processed. Unseen turns still require backend verification, including new turns in a file containing previously queued replies. Archive handling does not modify Codex files.
 
-If the current window says **Some completion notifications await source verification**, a completion record was found but could not be associated with an existing Codex backend on that machine. That notification is withheld and retried within the existing recovery window; other sessions continue monitoring. Open the status bar menu and choose **Show logs** for the UTC timestamp, machine, source ID, session name and ID, turn IDs, verification stage, and any OS error code. These diagnostics stay in the local output channel. A missing backend observation alone cannot distinguish synchronized history from a transient inspection failure; this message is unrelated to Codex command approval or notification transport.
+The hover omits routine monitor status. If it shows **Some completion notifications await source verification** under **Source status**, a completion record was found but could not be associated with an existing Codex backend on that machine. That notification is withheld and retried within the existing recovery window; other sessions continue monitoring. Open the status bar menu and choose **Show logs** for the UTC timestamp, machine, source ID, session name and ID, turn IDs, verification stage, and any OS error code. These diagnostics stay local. A missing backend observation alone cannot distinguish synchronized history from a transient inspection failure; this message is unrelated to Codex command approval or notification transport.
 
-Activity has its own persisted read position and runs before completion replay, so a busy notification cursor cannot starve the running-session list. Normal scans read at most 1 MiB and process at most 100 records. During initial lifecycle backfill, bounded batches can read up to 8 MiB, with a 250 ms pause between successful unfinished scans; the reader still reserves space for notification replay. After backfill, normal five-second polling resumes. Unknown backend bindings and invalid metadata do not trigger fast retries. UI snapshots from older versions cannot overwrite this activity state. Unchanged hover text is not reassigned; machine and session ordering is stable and elapsed time changes at minute resolution.
+Activity has its own persisted read position and runs before completion replay, so a busy notification cursor cannot starve the running-session list. Normal scans read at most 1 MiB and process at most 100 records. During lifecycle discovery or advancing notification replay, bounded batches can read up to 8 MiB, with a 250 ms pause between committed unfinished scans; the reader still reserves space for notification replay. Files take turns after the last actual read. Once caught up, normal five-second polling resumes. An incomplete final record, unknown backend binding or invalid metadata does not itself trigger fast retries. UI snapshots from older versions cannot overwrite this activity state. Unchanged hover text is not reassigned; machine and session ordering is stable and elapsed time changes at minute resolution.
 
 While a new window initializes, the status bar menu remains available. The first hover waits for real saved settings and the source's initial status; it does not briefly display guessed notification settings or an empty session list. A short settling period combines initial discoveries and transient diagnostics, capped at eight seconds after the first snapshot becomes available. Scan status follows activity publication, and subsequent UI changes are combined within 100 ms. Concurrent refresh requests wait for the latest read. Errors remain visible, and later session changes continue updating normally.
 
@@ -59,9 +65,11 @@ choose your channel, and enable notifications again. Settings under
 4. Optionally run **Send Test Notification** and check the received details. Sending a test always requires a Quick Pick confirmation. Tests are not required to enable a channel.
 5. Choose **Enable notifications** in this extension's status bar menu, or run **Enable Notifications**. Only replies completed after enabling are eligible. The selected channel and switch apply to windows sharing this local state and remain saved after restart.
 
-See [pushplus channel setup](docs/PUSHPLUS.md) for channel prerequisites, configuration codes (`option`), paid channels and validation limits. Select one channel at a time; switching channels disables automatic delivery until you enable it again. Reload all existing VS Code windows after upgrading before changing channels. Requests already submitted can still arrive through the previous channel.
+See [pushplus channel setup](https://github.com/PP2zk/codex-session-notifier/blob/publish/docs/PUSHPLUS.md) for channel prerequisites, configuration codes (`option`), paid channels and validation limits. Select one channel at a time; switching channels disables automatic delivery until you enable it again. Reload all existing VS Code windows after upgrading before changing channels. Requests already submitted can still arrive through the previous channel.
 
 The extension runs in the local UI host and starts with VS Code. No notification program, hook, package, or persistent service is installed remotely.
+
+Restricted Mode is supported: monitoring uses the machine's configured Codex data, independently of workspace trust. Executable paths and source settings are machine-scoped; workspace settings cannot override them. The project stays untrusted, and notification delivery still requires its separate opt-in.
 
 | Component | Requirement and reason |
 | --- | --- |
@@ -101,9 +109,15 @@ Plain and hex-encoded JSON Remote SSH authorities are discovered from the curren
 - **Remove pushplus Token** disables automatic delivery and deletes the local credential; it leaves the website binding unchanged. Replacing a token also disables delivery until you enable it again.
 - **Show Status** opens the bounded local monitor output. **Inspect Source** runs a small, read-only source diagnostic.
 
-The local SQLite outbox atomically deduplicates replies across windows. Automatic requests are spaced at least 13 seconds apart. A crash before HTTP submission can be retried; a crash or timeout after submission becomes unknown and is not blindly resent. Explicit provider rejection pauses delivery. Check your pushplus account's records and limits before using Enable again for future notifications. No extra Open API management credential is requested for result lookup.
+The local SQLite outbox atomically deduplicates replies across windows. Automatic requests from one client computer are spaced at least 13 seconds apart. Explicit provider rejection pauses delivery. Check your pushplus account's records and limits before using Enable again for future notifications. No extra Open API management credential is requested for result lookup.
 
-Offline completions can be recovered only with explicit completion evidence, within the 30-minute recovery window. On restart, pending names are read from specific metadata columns through the existing reader. Names and notification bodies are not stored in the outbox.
+Multiple client computers can monitor the same backend without sending duplicate automatic notifications. Before sending, they atomically claim the completion in `~/.codex-session-notifier/delivery-v1.sqlite` on the backend, using the existing local or SSH Python connection. All clients must use this feature, access the backend as the same OS user, and use the same pushplus token, channel and configuration code to share delivery claims. Different recipients remain independent. Monitoring, notification switches and channel settings stay local to each client; there is no permanently designated sender. Manual test messages are not deduplicated.
+
+No remote program or service is installed, and Codex files remain read-only. The shared database stores only hashed event identities, random claim tickets and timestamps. Claims expire after 24 hours and are cleaned during eligible claim operations; expired completions remain ineligible under the 30-minute recovery window. Storage is capped at 10,000 records and 16 MiB for the database; freed pages are reused. When coordination fails or fills up, automatic delivery waits instead of sending without a claim. An acquired claim survives a crash or uncertain send result, so another client cannot blindly resend it; a crash between claiming and sending can therefore lose that notification. A normal cancellation before sending releases its claim. Upgrade and reload all participating clients together; older clients do not honor shared claims.
+
+Replies completed before monitoring starts for a source are skipped, including records left in the pending outbox. A reply already running at startup can still notify when it completes afterward. If another window is already monitoring that same source, a new window shares its existing monitoring interval and does not discard eligible backlog. Restarting the last monitoring extension host, including a reload, begins a new interval; an older VS Code main process cannot keep an inactive source's cutoff alive.
+
+During an active monitoring interval, temporary SSH or network interruptions can recover eligible completions within the 30-minute window. Local extension-host process identities establish continuity independently of scan success. Presence records are bounded to 64 local monitors, removed on disposal, and pruned when their processes exit or their PIDs are reused. Pending names are read from specific metadata columns through the existing reader. Names and notification bodies are not stored in the outbox.
 
 Your local computer must be awake and able to reach the backend. Closing all VS Code windows stops monitoring. An open-source SDK does not make the hosted service fully open source or guarantee account safety.
 
@@ -132,11 +146,11 @@ Optional `CSN_TEST_SSH_HOST` and `CSN_TEST_SSH_EXECUTABLE` enable a small, autho
 
 ## Documentation
 
-See [pushplus channel setup](docs/PUSHPLUS.md) for recipient prerequisites and channel-specific limits.
+See [pushplus channel setup](https://github.com/PP2zk/codex-session-notifier/blob/publish/docs/PUSHPLUS.md) for recipient prerequisites and channel-specific limits.
 
 ## License
 
-[MIT](LICENSE.txt).
+[MIT](https://github.com/PP2zk/codex-session-notifier/blob/publish/LICENSE.txt).
 
 Third-party components retain their own licenses; see
-[third-party notices](THIRD_PARTY_NOTICES.md).
+[third-party notices](https://github.com/PP2zk/codex-session-notifier/blob/publish/THIRD_PARTY_NOTICES.md).

@@ -10,7 +10,7 @@ export interface ProbeResult {
   pythonVersion: string;
   codexHome: string;
   databaseExists: boolean;
-  samples: Array<{ sessionId: string; source: "vscode"; archived?: boolean; hasName: boolean; nameSource: "name" | "title" | "unset"; cliVersion?: string;
+  samples: Array<{ sessionId: string; source: "vscode" | "appServer"; archived?: boolean; hasName: boolean; nameSource: "name" | "title" | "unset"; cliVersion?: string;
     fileExists: boolean; fileBytes?: number; bytesRead?: number;
     explicitEvents?: Record<string, number>; completions?: Array<{ turnId: string; completedAt: string | null }> }>;
   warnings: string[];
@@ -58,7 +58,8 @@ export async function runReader(root: string, source: Source, request: unknown, 
       // Read them even when Python exits nonzero; never expose stderr or paths.
       try {
         const data = JSON.parse(stdout);
-        if (["database_missing", "unsupported_database_schema", "machine_identity_unavailable"].includes(data?.error)) {
+        if (["database_missing", "unsupported_database_schema", "machine_identity_unavailable",
+          "coordination_capacity_reached", "coordination_source_changed"].includes(data?.error)) {
           reject(new Error(data.error));
           return;
         }

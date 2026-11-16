@@ -41,6 +41,9 @@ test("source verification explains withheld completions without calling the whol
   assert.ok(content.includes("Still running"));
   assert.ok(content.includes("Some completion notifications await source verification"));
   assert.ok(content.includes("Show logs"));
+  assert.ok(content.includes("Source status:"));
+  assert.ok(!content.includes("Current window:"));
+  assert.ok(!content.includes("Monitoring"));
   assert.ok(!content.includes("execution source unverified"));
 });
 
@@ -53,6 +56,11 @@ test("snapshot ordering, heartbeats and shared-monitor diagnostics do not churn 
   const recent = { ...a, sessions: [{ ...a.sessions[0]!, startedAt: new Date(now - 1000).toISOString() }] };
   assert.equal(hoverContent(qq, [recent], "monitoring", now), hoverContent(qq, [recent], "monitoring", now + 5000));
   assert.ok(!before.includes("~spin"));
+  assert.ok(!before.includes("Current window:"));
+  assert.ok(!before.includes("Source status:"));
+  const failure = hoverContent(qq, [a], "probe_command_failed", now);
+  assert.ok(failure.includes("Source status: probe command failed"));
+  assert.ok(failure.includes("[Open menu]"));
 });
 
 

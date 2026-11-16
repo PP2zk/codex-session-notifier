@@ -3,10 +3,10 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { inspectSource } from "./probe";
 import { discoverSource } from "./source";
-import { completionText, Monitor, ScanResult, StateStore } from "./monitor";
+import { completionText, Monitor, ScanResult, StateStore, StoredDiagnostic } from "./monitor";
 import { Source } from "./source";
 import { registerQQCommands } from "./qq-commands";
-import { QqDelivery, resolveQueued } from "./delivery";
+import { QqDelivery, resolveQueued, sourceDeliveryGate } from "./delivery";
 import { StatusUI } from "./status-ui";
 import { plainLabel } from "./presentation";
 
@@ -25,9 +25,14 @@ export function activate(context: vscode.ExtensionContext) {
   let lastVerification = "";
   let outputBytes = 0;
   const append = (text: string) => {
+    if (!/^\d{4}-\d\d-\d\dT/.test(text)) text = `${new Date().toISOString()} ${text}`;
     outputBytes += Buffer.byteLength(text, "utf8");
     if (outputBytes > 1048576) { output.clear(); outputBytes = Buffer.byteLength(text, "utf8"); }
     output.appendLine(text);
+  };
+  const appendDiagnostic = ({ observedAt, sourceId, ...entry }: StoredDiagnostic) => {
+    append(`${new Date(observedAt * 1000).toISOString()} Diagnostic | ${JSON.stringify({ sourceId, ...entry,
+      ...(entry.sessionName ? { sessionName: plainLabel(entry.sessionName) } : {}) })}`);
   };
   const setStatus = (message: string, scan?: ScanResult) => {
     // A successful scan publishes its activity before updating the hover.
@@ -41,48 +46,56 @@ export function activate(context: vscode.ExtensionContext) {
   const getSender = registerQQCommands(context, store, append, () => { void ui?.refresh(); },
     action => ui ? ui.runInteraction(action) : action());
   ui = new StatusUI(store, async () => { await monitor?.tick(); });
+  let restarting = Promise.resolve();
+  let restartVersion = 0;
+  let disposed = false;
   const startMonitor = () => {
-    monitor?.dispose();
-    monitor = undefined;
-    lastVerification = "";
-    const settings = vscode.workspace.getConfiguration("codexSessionNotifier");
-    if (!settings.get<boolean>("enabled", true)) { setStatus("disabled"); return; }
-    try {
-      const authorities = (vscode.workspace.workspaceFolders || []).map(folder => folder.uri.authority);
-      const source = discoverSource(vscode.env.remoteName, authorities, settings.get<string>("sshHost", ""));
-      const selected = sourceSettings(settings, source);
-      const options = {
-        home: selected.home, python: settings.get<string>("pythonExecutable", ""),
-        ssh: settings.get<string>("sshExecutable", "") };
-      const delivery = new QqDelivery(store(), getSender, append);
-      monitor = new Monitor(context.extensionPath, source, database, options, (host, events) => {
-        const label = selected.label.trim() || host;
-        for (const event of events) append(completionText(label, event));
-      }, setStatus, 5000, undefined, async (sourceId, host, events, signal, scan) => {
-        await store().publishActivity(sourceId, selected.label.trim() || host, scan.activeSessions || [], scan.activityUnknown || 0)
-          .catch(() => append("Monitor UI: activity_snapshot_failed"));
-        if (signal.aborted) return;
-        const verification = JSON.stringify(scan.verificationFailures || []);
-        if (verification !== lastVerification) {
-          for (const failure of scan.verificationFailures || []) {
-            append(`${new Date().toISOString()} Completion withheld: source not verified | ${JSON.stringify({
-              machine: plainLabel(selected.label.trim() || host), sourceId,
-              ...failure, sessionName: failure.sessionName === null ? null : plainLabel(failure.sessionName)
-            })}`);
+    const version = ++restartVersion;
+    restarting = restarting.then(async () => {
+      if (disposed || version !== restartVersion) return;
+      await monitor?.dispose();
+      monitor = undefined;
+      if (disposed || version !== restartVersion) return;
+      lastVerification = "";
+      const settings = vscode.workspace.getConfiguration("codexSessionNotifier");
+      if (!settings.get<boolean>("enabled", true)) { setStatus("disabled"); return; }
+      try {
+        const authorities = (vscode.workspace.workspaceFolders || []).map(folder => folder.uri.authority);
+        const source = discoverSource(vscode.env.remoteName, authorities, settings.get<string>("sshHost", ""));
+        const selected = sourceSettings(settings, source);
+        const options = {
+          home: selected.home, python: settings.get<string>("pythonExecutable", ""),
+          ssh: settings.get<string>("sshExecutable", "") };
+        const delivery = new QqDelivery(store(), getSender, append, sourceDeliveryGate(context.extensionPath, source, options));
+        monitor = new Monitor(context.extensionPath, source, database, options, (host, events) => {
+          const label = selected.label.trim() || host;
+          for (const event of events) append(completionText(label, event));
+        }, setStatus, 5000, undefined, async (sourceId, host, events, signal, scan) => {
+          await store().publishActivity(sourceId, selected.label.trim() || host, scan.activeSessions || [], scan.activityUnknown || 0)
+            .catch(() => append("Monitor UI: activity_snapshot_failed"));
+          if (signal.aborted) return;
+          const verification = JSON.stringify(scan.verificationFailures || []);
+          if (verification !== lastVerification) {
+            for (const failure of scan.verificationFailures || []) {
+              append(`${new Date().toISOString()} Completion withheld: source not verified | ${JSON.stringify({
+                machine: plainLabel(selected.label.trim() || host), sourceId,
+                ...failure, sessionName: failure.sessionName === null ? null : plainLabel(failure.sessionName)
+              })}`);
+            }
+            lastVerification = verification;
           }
-          lastVerification = verification;
-        }
-        ui?.setMonitor(scan.warnings.length ? scan.warnings.join(", ") : "monitoring");
-        void ui?.refresh();
-        await delivery.drain(sourceId, host, events, selected.label,
-          item => resolveQueued(context.extensionPath, source, sourceId, item, { ...options, signal }), signal);
-      });
-      setStatus("starting");
-      monitor.start();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "source_not_identified";
-      setStatus(/^[a-z_]+$/.test(message) ? message : "source_not_identified");
-    }
+          ui?.setMonitor(scan.warnings.length ? scan.warnings.join(", ") : "monitoring");
+          void ui?.refresh();
+          await delivery.drain(sourceId, host, events, selected.label,
+            item => resolveQueued(context.extensionPath, source, sourceId, item, { ...options, signal }), signal);
+        }, entries => { for (const entry of entries) appendDiagnostic(entry); });
+        setStatus("starting");
+        monitor.start();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "source_not_identified";
+        setStatus(/^[a-z_]+$/.test(message) ? message : "source_not_identified");
+      }
+    }).catch(() => { if (!disposed) setStatus("monitor_failed"); });
   };
   let busy = false;
   const inspect = async () => {
@@ -108,9 +121,16 @@ export function activate(context: vscode.ExtensionContext) {
   };
   const register = <T>(id: string, action: () => T | PromiseLike<T>) =>
     vscode.commands.registerCommand(`codexSessionNotifier.${id}`, () => ui!.runInteraction(action));
-  context.subscriptions.push(output, ui, { dispose: () => monitor?.dispose() },
+  context.subscriptions.push(output, ui, { dispose: () => { disposed = true; return monitor?.dispose(); } },
     register("inspect", inspect),
-    register("showStatus", () => output.show(true)),
+    register("showStatus", async () => {
+      try {
+        const { entries } = await store().diagnostics();
+        append("Recent diagnostic history (up to 100 entries)");
+        for (const entry of entries) appendDiagnostic(entry);
+      } catch { append("Diagnostic history unavailable"); }
+      output.show(true);
+    }),
     register("openMenu", () => ui!.showMenu()),
     register("refreshStatus", async () => { await monitor?.tick(); await ui?.refresh(); }),
     register("openSettings", () => vscode.commands.executeCommand("workbench.action.openSettings", `@ext:${context.extension.id}`)),

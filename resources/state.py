@@ -1,15 +1,169 @@
 """Local-only SQLite cursors and atomic outbox. Never invoked over SSH."""
 
 import argparse
+import calendar
+import ctypes
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import unicodedata
 from datetime import datetime
+
+
+def process_started_at(pid):
+    """Read a local process birth time without installing packages."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2 ** 31:
+        return None
+    try:
+        if os.name == "nt":
+            from ctypes import wintypes as w
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+            kernel.OpenProcess.restype = w.HANDLE
+            kernel.GetProcessTimes.argtypes = [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4
+            kernel.GetProcessTimes.restype = w.BOOL
+            kernel.CloseHandle.argtypes = [w.HANDLE]
+            handle = kernel.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            try:
+                times = [w.FILETIME() for _ in range(4)]
+                if not kernel.GetProcessTimes(handle, *[ctypes.byref(value) for value in times]):
+                    return None
+                ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                started = ticks / 10000000 - 11644473600
+            finally:
+                kernel.CloseHandle(handle)
+        elif Path("/proc/self/stat").is_file():
+            with open("/proc/%d/stat" % pid) as stream:
+                stat = stream.read(4096)
+            ticks = int(stat[stat.rfind(")") + 2:].split()[19])
+            with open("/proc/stat") as stream:
+                boot = next(int(line.split()[1]) for line in stream if line.startswith("btime "))
+            started = boot + ticks / os.sysconf("SC_CLK_TCK")
+        else:
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                                    timeout=2, check=True, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+            started = calendar.timegm(time.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y"))
+        # Native completed_at values can have only second precision.
+        return int(started) if 0 < started <= time.time() + 1 else None
+    except (OSError, ValueError, IndexError, StopIteration, subprocess.SubprocessError):
+        return None
+
+
+def source_cutoff(conn, source):
+    row = conn.execute("SELECT state FROM sources WHERE id=?", (source,)).fetchone()
+    value = json.loads(row[0]).get("startedAt", 0) if row else 0
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else 0
+
+
+def completion_timestamp(completed):
+    try:
+        value = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+        return value.timestamp() if value.tzinfo else 0
+    except (ValueError, OverflowError, AttributeError):
+        return 0
+
+
+def project_diagnostic(item):
+    if not isinstance(item, dict) or item.get("kind") not in ("activity", "completion", "scan"):
+        raise ValueError("invalid_diagnostics")
+    clean = {"kind": item["kind"]}
+    for key in ("sessionId", "sessionName", "turnId", "completedAt", "state", "reason", "bindingReason", "operation"):
+        value = item.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > 128):
+            raise ValueError("invalid_diagnostics")
+        if key in item:
+            clean[key] = value
+    if not isinstance(clean.get("sessionId"), str) or not all(isinstance(clean.get(k), str) and re.fullmatch("[a-z_]+", clean[k]) for k in ("state", "reason")):
+        raise ValueError("invalid_diagnostics")
+    for key in ("fileBytes", "observedBytes", "lookbackBytes", "offset", "bytesRead", "runningCount", "unknownCount", "position", "osError", "processId", "cutoff"):
+        if key in item:
+            value = item[key]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 2 ** 53:
+                raise ValueError("invalid_diagnostics")
+            clean[key] = value
+    if len(json.dumps(clean, ensure_ascii=True)) > 1536 and isinstance(clean.get("sessionName"), str):
+        clean["sessionName"] = clean["sessionName"][:32]
+    if len(json.dumps(clean, ensure_ascii=True)) > 1536:
+        raise ValueError("invalid_diagnostics")
+    return clean
+
+
+def project_diagnostics(items):
+    projected = []
+    for item in items[:256] if isinstance(items, list) else []:
+        try:
+            projected.append(project_diagnostic(item))
+        except (ValueError, TypeError):
+            # Optional telemetry cannot reject an authoritative cursor commit.
+            continue
+    return projected
+
+
+def record_diagnostics(conn, source, items, now):
+    added = []
+    conn.execute("DELETE FROM diagnostics WHERE observed_at<?", (now - 7 * 86400,))
+    for item in items:
+        last = conn.execute("SELECT observed_at,details FROM diagnostics WHERE source_id=? AND kind=? AND session_id=? ORDER BY id DESC LIMIT 1",
+                            (source, item["kind"], item["sessionId"])).fetchone()
+        fingerprint = lambda value: tuple(value.get(k) for k in ("state", "reason", "turnId", "bindingReason", "osError", "cutoff"))
+        heartbeat = 60 if item["kind"] == "scan" else 300
+        if last and fingerprint(json.loads(last[1])) == fingerprint(item) and (item["kind"] == "completion" or now - last[0] < heartbeat):
+            continue
+        conn.execute("INSERT INTO diagnostics(observed_at,source_id,kind,session_id,details) VALUES(?,?,?,?,?)",
+                     (now, source, item["kind"], item["sessionId"], json.dumps(item, ensure_ascii=True)))
+        added.append({"observedAt": now, "sourceId": source, **item})
+    conn.execute("DELETE FROM diagnostics WHERE id NOT IN (SELECT id FROM diagnostics ORDER BY id DESC LIMIT 4096)")
+    return added
+
+
+def monitor_presence(conn, source, request):
+    owner = request.get("owner")
+    if not isinstance(owner, str) or not re.fullmatch("[0-9a-f-]{36}", owner):
+        raise ValueError("invalid_owner")
+    conn.execute("CREATE TABLE IF NOT EXISTS monitor_presence(source_id TEXT,owner TEXT,pid INTEGER NOT NULL,process_start INTEGER NOT NULL,cutoff REAL NOT NULL,PRIMARY KEY(source_id,owner))")
+    conn.execute("BEGIN IMMEDIATE")
+    if request["operation"] == "monitor_leave":
+        conn.execute("DELETE FROM monitor_presence WHERE source_id=? AND owner=?", (source, owner))
+        conn.commit()
+        return {"released": True}
+    now, start, pid = time.time(), request.get("startedAt"), request.get("pid")
+    if not isinstance(start, (int, float)) or isinstance(start, bool) or not 0 < start <= now + 1:
+        raise ValueError("invalid_startup_boundary")
+    birth = process_started_at(pid)
+    if birth is None:
+        raise ValueError("monitor_process_unverified")
+    births = {pid: birth}
+    for sid, token, other_pid, other_birth in conn.execute("SELECT source_id,owner,pid,process_start FROM monitor_presence").fetchall():
+        if other_pid not in births:
+            births[other_pid] = process_started_at(other_pid)
+        if births[other_pid] != other_birth:
+            conn.execute("DELETE FROM monitor_presence WHERE source_id=? AND owner=?", (sid, token))
+    peers = conn.execute("SELECT cutoff FROM monitor_presence WHERE source_id=?", (source,)).fetchall()
+    saved = conn.execute("SELECT state FROM sources WHERE id=?", (source,)).fetchone()
+    state = json.loads(saved[0]) if saved else None
+    previous = source_cutoff(conn, source)
+    cutoff = previous if peers and previous else min(row[0] for row in peers) if peers else max(previous, start)
+    if not conn.execute("SELECT 1 FROM monitor_presence WHERE source_id=? AND owner=?", (source, owner)).fetchone() and conn.execute("SELECT COUNT(*) FROM monitor_presence").fetchone()[0] >= 64:
+        raise ValueError("monitor_presence_capacity_reached")
+    conn.execute("INSERT INTO monitor_presence VALUES(?,?,?,?,?) ON CONFLICT(source_id,owner) DO UPDATE SET pid=excluded.pid,process_start=excluded.process_start,cutoff=excluded.cutoff",
+                 (source, owner, pid, birth, cutoff))
+    if state is not None and state.get("startedAt") != cutoff:
+        state["startedAt"] = cutoff
+        # Invalidate any scan loaded before the new monitoring interval.
+        conn.execute("UPDATE sources SET state=?,revision=revision+1 WHERE id=?", (json.dumps(state, ensure_ascii=True), source))
+    diagnostics = record_diagnostics(conn, source, [{"kind": "scan", "sessionId": "", "state": "monitoring",
+        "reason": "monitor_joined" if peers else "monitor_started", "processId": pid, "cutoff": cutoff}], now)
+    conn.commit()
+    return {"startedAt": cutoff, "diagnostics": diagnostics}
 
 
 def qq_operation(conn, request):
@@ -61,13 +215,9 @@ def qq_operation(conn, request):
         if channel[0] is None or channel[1] or channel[3] or channel[2] > now:
             return {"item": None}
         rows = conn.execute("SELECT o.session_id,o.turn_id,o.completed_at FROM outbox o LEFT JOIN qq_delivery d ON o.source_id=d.source_id AND o.session_id=d.session_id AND o.turn_id=d.turn_id WHERE o.source_id=? AND d.status IS NULL AND o.queued_at>=? ORDER BY o.queued_at LIMIT 200", (request["sourceId"], now - 1800))
+        cutoff = max(channel[0], now - 1800, source_cutoff(conn, request["sourceId"]))
         for sid, turn, completed in rows:
-            try:
-                completed_at = datetime.fromisoformat(completed.replace("Z", "+00:00"))
-                timestamp = completed_at.timestamp() if completed_at.tzinfo else 0
-            except (ValueError, OverflowError):
-                timestamp = 0
-            if not max(channel[0], now - 1800) <= timestamp <= now + 60:
+            if not cutoff <= completion_timestamp(completed) <= now + 60:
                 continue
             conn.execute("INSERT INTO qq_delivery VALUES(?,?,?,'preparing',?,NULL,NULL)", (request["sourceId"], sid, turn, ticket))
             conn.execute("UPDATE qq_channel SET ticket=?,expires=? WHERE id=1", (ticket, now + 45))
@@ -78,6 +228,9 @@ def qq_operation(conn, request):
     if operation == "qq_begin":
         if channel[0] is None or channel[1]:
             return {"updated": False}
+        pending = conn.execute("SELECT o.source_id,o.completed_at FROM qq_delivery d JOIN outbox o USING(source_id,session_id,turn_id) WHERE d.ticket=? AND d.status='preparing'", (ticket,)).fetchone()
+        if not pending or completion_timestamp(pending[1]) < source_cutoff(conn, pending[0]):
+            return {"updated": False}
         changed = conn.execute("UPDATE qq_delivery SET status='sending' WHERE ticket=? AND status='preparing'", (ticket,)).rowcount
         if changed:
             # Respect the provider's five requests/minute cap across windows.
@@ -86,10 +239,10 @@ def qq_operation(conn, request):
     if operation != "qq_finish":
         raise ValueError("invalid_operation")
     outcome = request.get("outcome")
-    if outcome not in ("retry", "accepted", "unknown", "rejected"):
+    if outcome not in ("retry", "accepted", "unknown", "rejected", "suppressed"):
         raise ValueError("invalid_outcome")
     row = conn.execute("SELECT status FROM qq_delivery WHERE ticket=?", (ticket,)).fetchone()
-    if not row or row[0] != ("preparing" if outcome == "retry" else "sending"):
+    if not row or row[0] != ("preparing" if outcome in ("retry", "suppressed") else "sending"):
         return {"updated": False}
     receipt, code = request.get("receipt"), request.get("code")
     if receipt is not None and (not isinstance(receipt, str) or not re.fullmatch("[A-Za-z0-9_-]{1,128}", receipt)):
@@ -100,7 +253,7 @@ def qq_operation(conn, request):
         conn.execute("DELETE FROM qq_delivery WHERE ticket=? AND status='preparing'", (ticket,))
         conn.execute("UPDATE qq_channel SET next_at=MAX(next_at,?) WHERE id=1", (now + 10,))
     else:
-        conn.execute("UPDATE qq_delivery SET status=?,receipt=?,code=? WHERE ticket=? AND status='sending'", (outcome, receipt, code, ticket))
+        conn.execute("UPDATE qq_delivery SET status=?,receipt=?,code=? WHERE ticket=?", (outcome, receipt, code, ticket))
     if outcome == "rejected" and request.get("routeRevision", 0) == route[2]:
         conn.execute("UPDATE qq_channel SET paused=? WHERE id=1", (code or "qq_rejected",))
     conn.execute("UPDATE qq_channel SET ticket=NULL,expires=NULL WHERE id=1")
@@ -108,8 +261,10 @@ def qq_operation(conn, request):
 
 
 def operate(database, request):
+    if request.get("operation") == "process_start":
+        return {"startedAt": process_started_at(request.get("pid"))}
     source = request.get("sourceId")
-    if request.get("operation") not in ("qq_enable", "qq_disable", "qq_status", "qq_begin", "qq_finish", "qq_configure", "activity_overview") and (not isinstance(source, str) or not re.fullmatch("[0-9a-f]{64}", source)):
+    if request.get("operation") not in ("qq_enable", "qq_disable", "qq_status", "qq_begin", "qq_finish", "qq_configure", "activity_overview", "diagnostics") and (not isinstance(source, str) or not re.fullmatch("[0-9a-f]{64}", source)):
         raise ValueError("invalid_source")
     Path(database).parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(database, timeout=2)) as conn:
@@ -118,6 +273,13 @@ def operate(database, request):
         conn.execute("CREATE TABLE IF NOT EXISTS outbox(source_id TEXT, session_id TEXT, turn_id TEXT, completed_at TEXT NOT NULL, queued_at REAL NOT NULL, PRIMARY KEY(source_id,session_id,turn_id))")
         conn.execute("CREATE TABLE IF NOT EXISTS leases(source_id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires REAL NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS activity_progress(source_id TEXT PRIMARY KEY,state TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS diagnostics(id INTEGER PRIMARY KEY,observed_at REAL NOT NULL,source_id TEXT NOT NULL,kind TEXT NOT NULL,session_id TEXT NOT NULL,details TEXT NOT NULL)")
+        conn.execute("CREATE INDEX IF NOT EXISTS diagnostics_identity ON diagnostics(source_id,kind,session_id,id)")
+        if request.get("operation") in ("monitor_join", "monitor_leave"):
+            return monitor_presence(conn, source, request)
+        if request.get("operation") == "diagnostics":
+            rows = conn.execute("SELECT observed_at,source_id,details FROM diagnostics WHERE observed_at>=? ORDER BY id DESC LIMIT 100", (time.time() - 7 * 86400,)).fetchall()
+            return {"entries": [{"observedAt": at, "sourceId": source, **json.loads(details)} for at, source, details in reversed(rows)]}
         if request.get("operation") in ("activity_publish", "activity_overview"):
             conn.execute("CREATE TABLE IF NOT EXISTS activity_current(source_id TEXT PRIMARY KEY,machine TEXT NOT NULL,sessions TEXT NOT NULL,unknown_count INTEGER NOT NULL,updated_at REAL NOT NULL)")
             conn.execute("BEGIN IMMEDIATE")
@@ -186,6 +348,7 @@ def operate(database, request):
         if not isinstance(state, dict) or not isinstance(events, list) or len(events) > 100:
             raise ValueError("invalid_state")
         state = dict(state)
+        diagnostics = project_diagnostics(request.get("diagnostics", []))
         activity = state.pop("activity", None)
         serialized_activity = None
         if activity is not None:
@@ -196,19 +359,19 @@ def operate(database, request):
                 if not isinstance(sid, str) or not 1 <= len(sid) <= 128 or not isinstance(progress, dict):
                     raise ValueError("invalid_activity_state")
                 clean = {}
-                for key in ("fileKey", "activeTurn", "activeStartedAt"):
+                for key in ("fileKey", "activeTurn", "activeStartedAt", "activityAnchor"):
                     value = progress.get(key)
                     if value is not None and (not isinstance(value, str) or len(value) > 128):
                         raise ValueError("invalid_activity_state")
                     if key in progress:
                         clean[key] = value
-                for key in ("observedSize", "activityLookback", "activityCheckedAt", "activityOrder"):
+                for key in ("observedSize", "activityLookback", "activityCheckedAt", "activityOrder", "activityOffset"):
                     value = progress.get(key)
                     if key in progress:
                         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 2 ** 53:
                             raise ValueError("invalid_activity_state")
                         clean[key] = value
-                for key in ("activityKnown", "activityHeaderVerified", "activityBound"):
+                for key in ("activityKnown", "activityHeaderVerified", "activityBound", "activityInitChecked", "activityInitializationOnly"):
                     if key in progress:
                         if not isinstance(progress[key], bool):
                             raise ValueError("invalid_activity_state")
@@ -246,8 +409,17 @@ def operate(database, request):
         if serialized_activity is not None:
             conn.execute("INSERT INTO activity_progress VALUES(?,?) ON CONFLICT(source_id) DO UPDATE SET state=excluded.state", (source, serialized_activity))
         conn.execute("DELETE FROM activity_progress WHERE NOT EXISTS(SELECT 1 FROM sources s WHERE s.id=activity_progress.source_id)")
+        logged = record_diagnostics(conn, source, diagnostics, now)
         conn.commit()
-        return {"committed": True, "added": added}
+        response = {"committed": True, "added": added, "diagnostics": []}
+        remaining = 240000 - len(json.dumps(response, ensure_ascii=True))
+        for item in logged:
+            size = len(json.dumps(item, ensure_ascii=True)) + 1
+            if size > remaining:
+                continue
+            response["diagnostics"].append(item)
+            remaining -= size
+        return response
 
 
 def main():

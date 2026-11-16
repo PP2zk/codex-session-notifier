@@ -62,9 +62,12 @@ export function hoverContent(qq: QqStatus, sources: ActivitySource[], monitor: s
   if (checking.length) lines.push(`Checking source status: ${checking.map(source => markdownText(source.machine)).join(", ")}.`, "");
   if (delayed.length) lines.push(`$(history) Source updates delayed: ${delayed.map(source => markdownText(source.machine)).join(", ")}.`, "");
   if (!sources.length) lines.push("Waiting for a fresh source snapshot.", "");
-  const state = monitor.split(", ").map(code => ["monitoring", "read_backlog", "monitored_in_another_window"].includes(code) ? "Monitoring" :
-    code === "execution_source_unverified" ? "Some completion notifications await source verification (Open menu > Show logs)" : code.replace(/_/g, " ")).join(", ");
-  lines.push("---", "", `Current window: ${markdownText(state)}`, "",
-    "[Open menu](command:codexSessionNotifier.openMenu) · [Refresh](command:codexSessionNotifier.refreshStatus)");
+  const diagnostics = monitor.split(", ").filter(code => code &&
+    !["monitoring", "read_backlog", "monitored_in_another_window", "starting"].includes(code))
+    .map(code => code === "execution_source_unverified" ?
+      "Some completion notifications await source verification (Open menu > Show logs)" : code.replace(/_/g, " "));
+  lines.push("---", "");
+  if (diagnostics.length) lines.push(`Source status: ${markdownText(diagnostics.join(", "))}`, "");
+  lines.push("[Open menu](command:codexSessionNotifier.openMenu) · [Refresh](command:codexSessionNotifier.refreshStatus)");
   return insetHover(lines.join("\n"));
 }

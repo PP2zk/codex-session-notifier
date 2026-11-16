@@ -30,10 +30,75 @@ test("a missing Codex database produces the specific reader diagnostic", async t
     { initialized: false, startedAt: Date.now() / 1000, position: 0, cursors: {} }, { home: temporary }), /database_missing/);
 });
 
+test("local process startup uses the shared process birth rather than query time", async t => {
+  const temporary = await mkdtemp(join(tmpdir(), "csn-process-start-"));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  const store = new StateStore(resolve(__dirname, "../.."), join(temporary, "state.sqlite"));
+  const result = await store.processStart(process.pid);
+  assert.equal(typeof result.startedAt, "number");
+  assert.ok(Math.abs(result.startedAt! - (Date.now() / 1000 - process.uptime())) < 2);
+  assert.equal((await store.processStart(-1)).startedAt, null);
+});
+
+test("a source startup raises the cutoff while live peers preserve its monitoring interval", async t => {
+  const temporary = await mkdtemp(join(tmpdir(), "csn-startup-"));
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  const database = join(temporary, "state.sqlite"), sourceId = "d".repeat(64);
+  const root = resolve(__dirname, "../.."), store = new StateStore(root, database);
+  const appStart = Math.floor(Date.now() / 1000) - 30;
+  const cursors = { session: { offset: 12345, parser: { activeTurn: "already-running" } } };
+  const activity = { session: { fileKey: "a".repeat(64), observedSize: 12345, activityKnown: true, activeTurn: "already-running" } };
+  await store.commit(sourceId, 0, { initialized: true, startedAt: appStart - 86400, position: 0, cursors, activity, notificationBacklog: true }, []);
+  const observed: Array<import("../src/monitor").ScanState> = [];
+  const reader: typeof scanSource = async (_root, _source, state) => {
+    if (state.initialized) observed.push(state);
+    return { schemaVersion: 2, sourceId, hostname: "host", initialized: true, position: 0,
+      cursors: state.cursors, activity: state.activity || {}, events: [], warnings: [], bytesRead: 0 };
+  };
+  const make = (start: number) => new Monitor(root, { kind: "local" }, database, {}, () => {}, () => {}, 5000, reader,
+    undefined, undefined, Promise.resolve(start));
+  const first = make(appStart), peer = make(appStart + 5);
+  t.after(async () => { await Promise.all([first.dispose(), peer.dispose()]); });
+  await first.tick();
+  await peer.tick();
+  assert.equal(observed.length, 2);
+  assert.ok(observed.every(state => state.startedAt === appStart && state.initialized));
+  assert.deepEqual(observed[0]?.cursors, cursors);
+  assert.deepEqual(observed[0]?.activity, activity);
+  assert.equal(observed[0]?.notificationBacklog, true);
+  assert.equal((await store.load(sourceId)).state?.startedAt, appStart);
+  await Promise.all([first.dispose(), peer.dispose()]);
+  const laterStart = appStart + 10, restarted = make(laterStart);
+  t.after(() => restarted.dispose());
+  await restarted.tick();
+  assert.equal((await store.load(sourceId)).state?.startedAt, laterStart);
+  assert.deepEqual((await store.load(sourceId)).state?.cursors, cursors);
+});
+
+test("disposal waits for a pending presence join before removing its owner", async t => {
+  let entered!: () => void, finish!: (value: { startedAt: number; diagnostics: [] }) => void;
+  const entering = new Promise<void>(resolve => { entered = resolve; });
+  const joining = new Promise<{ startedAt: number; diagnostics: [] }>(resolve => { finish = resolve; });
+  const operations: string[] = [];
+  t.mock.method(StateStore.prototype, "monitorJoin", () => { operations.push("join"); entered(); return joining; });
+  t.mock.method(StateStore.prototype, "monitorLeave", async () => { operations.push("leave"); });
+  const reader: typeof scanSource = async () => ({ schemaVersion: 2, sourceId: "a".repeat(64), hostname: "host",
+    initialized: true, cursors: {}, position: 0, bytesRead: 0, warnings: [], events: [] });
+  const monitor = new Monitor("unused", { kind: "local" }, "unused", {}, () => assert.fail("no notifications"), () => {}, 5000, reader);
+  const ticking = monitor.tick();
+  await entering;
+  const disposing = monitor.dispose();
+  assert.deepEqual(operations, ["join"]);
+  finish({ startedAt: Math.floor(Date.now() / 1000), diagnostics: [] });
+  await Promise.all([ticking, disposing]);
+  assert.deepEqual(operations, ["join", "leave"]);
+});
+
 test("verification diagnostics cross the reader boundary with validated identities and error codes", async () => {
   const probe = require("../src/probe") as typeof import("../src/probe");
   const original = probe.runReader;
-  const failure = { sessionId: "session", sessionName: "Test task", turnIds: ["turn"], reason: "windows_list_failed", osError: 5 };
+  const failure = { sessionId: "session", sessionName: "Test task", turnIds: ["turn"], reason: "process_image_failed", osError: 5,
+    operation: "OpenProcess", processId: 4321 };
   const response = { schemaVersion: 2, sourceId: "a".repeat(64), hostname: "host", initialized: true,
     position: 0, cursors: {}, events: [], warnings: ["execution_source_unverified"], bytesRead: 0,
     activeSessions: [], activityUnknown: 0, activity: {}, verificationFailures: [failure] };
@@ -41,11 +106,35 @@ test("verification diagnostics cross the reader boundary with validated identiti
   try {
     probe.runReader = async () => response;
     assert.deepEqual((await read()).verificationFailures, [failure]);
+    failure.operation = "untrusted raw path or API text";
+    await assert.rejects(read(), /invalid_scan_response/);
+    failure.operation = "OpenProcess";
+    failure.processId = -1;
+    await assert.rejects(read(), /invalid_scan_response/);
+    failure.processId = 4321;
     failure.reason = "raw unexpected error text";
     await assert.rejects(read(), /invalid_scan_response/);
     failure.reason = "windows_list_failed";
     failure.osError = -1;
     await assert.rejects(read(), /invalid_scan_response/);
+  } finally { probe.runReader = original; }
+});
+
+test("optional diagnostic Unicode and invalid detail never reject a valid scan", async () => {
+  const probe = require("../src/probe") as typeof import("../src/probe");
+  const original = probe.runReader;
+  const diagnostic = { kind: "activity", sessionId: "session", sessionName: "\u{1F600}".repeat(96),
+    state: "running", reason: "task_started", fileBytes: 10 };
+  const response = { schemaVersion: 2, sourceId: "a".repeat(64), hostname: "host", initialized: true,
+    position: 0, cursors: {}, events: [], warnings: [], bytesRead: 0,
+    activeSessions: [], activityUnknown: 0, activity: {}, diagnostics: [diagnostic] };
+  try {
+    probe.runReader = async () => response;
+    const read = () => scanSource("unused", { kind: "local" }, { initialized: true, startedAt: 1, position: 0, cursors: {} });
+    assert.equal((await read()).diagnostics?.[0]?.sessionName, diagnostic.sessionName);
+    diagnostic.fileBytes = -1;
+    response.diagnostics = [diagnostic];
+    assert.deepEqual((await read()).diagnostics, []);
   } finally { probe.runReader = original; }
 });
 
@@ -56,14 +145,17 @@ test("two windows and a restarted monitor share atomic, durable completion dedup
   const database = join(temporary, "state.sqlite");
   let turn = "turn1";
   const observed: string[] = [];
+  const diagnosticTurns: Array<string | null | undefined> = [];
   const reader: typeof scanSource = async (_root, _source, state) => ({ schemaVersion: 2, sourceId: "a".repeat(64), hostname: "test-host",
     initialized: true, cursors: {}, position: 0, bytesRead: 0, warnings: [],
+    diagnostics: [{ kind: "activity", sessionId: "session", turnId: turn, state: "running", reason: "task_started" }],
     events: state.initialized ? [{ sessionId: "session", sessionName: "Test", nameSource: "title", nameState: "resolved", turnId: turn,
       completedAt: new Date().toISOString(), evidence: "persisted-completion" }] : [] });
   const create = () => new Monitor(resolve(__dirname, "../.."), { kind: "local" }, database, {},
-    (_host, events) => observed.push(...events.map(event => event.turnId)), () => {}, 5000, reader);
+    (_host, events) => observed.push(...events.map(event => event.turnId)), () => {}, 5000, reader, undefined,
+    entries => diagnosticTurns.push(...entries.filter(entry => entry.kind === "activity").map(entry => entry.turnId)));
   const first = create(), second = create();
-  t.after(() => { first.dispose(); second.dispose(); });
+  t.after(async () => { await Promise.all([first.dispose(), second.dispose()]); });
   await Promise.all([first.tick(), second.tick()]);
   assert.deepEqual(observed, []);
   await Promise.all([first.tick(), second.tick()]);
@@ -71,7 +163,8 @@ test("two windows and a restarted monitor share atomic, durable completion dedup
   turn = "turn2";
   await Promise.all([first.tick(), second.tick()]);
   assert.deepEqual(observed, ["turn1", "turn2"]);
-  first.dispose(); second.dispose();
+  assert.deepEqual(diagnosticTurns, ["turn1", "turn2"]);
+  await Promise.all([first.dispose(), second.dispose()]);
   const restarted = create();
   t.after(() => restarted.dispose());
   await restarted.tick();
@@ -125,7 +218,8 @@ test("the reader receives committed source identities without persisting them in
   assert.equal(saved.state?.knownCompletions, undefined);
 });
 
-test("unfinished activity discovery continues promptly then returns to normal polling", async t => {
+for (const backlog of ["activityBacklog", "notificationBacklog"] as const) {
+test(`unfinished ${backlog} continues promptly then returns to normal polling`, async t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const temporary = await mkdtemp(join(tmpdir(), "csn-monitor-"));
   t.after(() => rm(temporary, { recursive: true, force: true }));
@@ -133,10 +227,14 @@ test("unfinished activity discovery continues promptly then returns to normal po
   let completed = 0;
   const scanStatuses: Array<unknown> = [];
   let finished: (() => void) | undefined;
-  const reader: typeof scanSource = async () => {
+  const flags: Array<boolean | undefined> = [];
+  const reader: typeof scanSource = async (_root, _source, state) => {
     calls++;
+    flags.push(state.notificationBacklog);
     return { schemaVersion: 2, sourceId: "c".repeat(64), hostname: "test-host", initialized: true,
-      cursors: {}, position: 0, bytesRead: 1, warnings: [], events: [], activityBacklog: calls === 1 };
+      cursors: {}, position: 0, bytesRead: 1, warnings: [], events: [],
+      activityBacklog: backlog === "activityBacklog" && calls === 1,
+      notificationBacklog: backlog === "notificationBacklog" && calls === 1 };
   };
   const monitor = new Monitor(resolve(__dirname, "../.."), { kind: "local" }, join(temporary, "state.sqlite"), {},
     () => {}, (_message, scan) => { scanStatuses.push(scan); }, 5000, reader, async () => { completed++; finished?.(); });
@@ -152,6 +250,7 @@ test("unfinished activity discovery continues promptly then returns to normal po
   // Finish lease release and timer scheduling before advancing mocked time.
   while ((monitor as unknown as { running: boolean }).running) await immediate();
   assert.equal(completed, 2);
+  assert.equal(flags[1], backlog === "notificationBacklog");
   t.mock.timers.tick(4999);
   await immediate();
   assert.equal(calls, 2);
@@ -160,6 +259,8 @@ test("unfinished activity discovery continues promptly then returns to normal po
   await third;
   while ((monitor as unknown as { running: boolean }).running) await immediate();
   assert.equal(calls, 3);
+  assert.equal(flags[2], false);
   assert.equal(scanStatuses.length, 3);
   assert.ok(scanStatuses.every(scan => scan && typeof scan === "object" && "hostname" in scan), "completed scans expose their publication context");
 });
+}

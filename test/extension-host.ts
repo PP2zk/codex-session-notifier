@@ -11,6 +11,16 @@ export async function run(): Promise<void> {
   const manifest = JSON.parse(readFileSync(join(__dirname, "../../package.json"), "utf8"));
   const extension = vscode.extensions.getExtension(`${manifest.publisher}.${manifest.name}`);
   assert.ok(extension, "development extension must be discoverable");
+  if (process.env.CSN_TEST_UNTRUSTED === "1") {
+    assert.equal(vscode.workspace.isTrusted, false, "trust protection must stay enabled during Restricted Mode tests");
+    assert.ok(vscode.workspace.workspaceFolders?.length, "test must open an actual untrusted workspace");
+    const settings = vscode.workspace.getConfiguration("codexSessionNotifier");
+    for (const [id, schema] of Object.entries(manifest.contributes.configuration.properties) as Array<[string, { scope: string; default: unknown }]>) {
+      assert.equal(schema.scope, "machine", `${id} must not accept workspace overrides`);
+      assert.deepEqual(settings.get(id.slice("codexSessionNotifier.".length)), schema.default,
+        `${id}: the attempted workspace override must be ignored`);
+    }
+  }
   const deadline = Date.now() + 5000;
   while (!extension.isActive && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
   assert.ok(extension.isActive, "must activate automatically on startup");
@@ -50,6 +60,36 @@ export async function run(): Promise<void> {
   assert.ok(api.getUI().tooltip.includes("Running sessions"), "the initial hover waits for real persisted status");
   console.log(`P2 extension host: automatic monitor and local SQLite scan passed (${api.getStatus()})`);
   console.log("P0 extension host: automatic local UI activation and real local metadata passed");
+  if (process.env.CSN_TEST_SOURCE_RESTART === "1") {
+    const database = join(process.env.CSN_TEST_USER_DATA_DIR!, "User", "globalStorage", extension.id.toLowerCase(), "monitor.sqlite");
+    const store = new StateStore(extension.extensionPath, resolve(database));
+    const sourceId = (await store.activityOverview()).sources[0]!.sourceId;
+    const before = (await store.load(sourceId)).state!.startedAt;
+    assert.ok(before);
+    const settings = vscode.workspace.getConfiguration("codexSessionNotifier");
+    await settings.update("enabled", false, vscode.ConfigurationTarget.Global);
+    const stopDeadline = Date.now() + 10000;
+    while (api.getStatus() !== "disabled" && Date.now() < stopDeadline) await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(api.getStatus(), "disabled");
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await settings.update("enabled", true, vscode.ConfigurationTarget.Global);
+    const restartDeadline = Date.now() + 15000;
+    let after = before;
+    while (Date.now() < restartDeadline) {
+      after = (await store.load(sourceId)).state!.startedAt;
+      if (after > before && ["monitoring", "read_backlog"].includes(api.getStatus())) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(after > before, "the replacement must start a new interval after leaving the last membership");
+    assert.equal((await store.qqStatus()).enabled, false);
+    console.log("Source restart: configuration disposal and replacement establish a new interval; no external sends");
+  }
+  if (process.env.CSN_TEST_UNTRUSTED === "1") {
+    const database = join(process.env.CSN_TEST_USER_DATA_DIR!, "User", "globalStorage", extension.id.toLowerCase(), "monitor.sqlite");
+    const store = new StateStore(extension.extensionPath, resolve(database));
+    assert.equal((await store.qqStatus()).enabled, false, "Restricted Mode must not enable notifications");
+    console.log("Restricted Mode: untrusted workspace, automatic monitoring and machine-setting isolation passed; no external sends");
+  }
   if (process.env.CSN_TEST_EXPECT_SESSION) {
     const database = join(process.env.CSN_TEST_USER_DATA_DIR!, "User", "globalStorage", extension.id.toLowerCase(), "monitor.sqlite");
     const store = new StateStore(extension.extensionPath, resolve(database));
@@ -105,7 +145,7 @@ export async function run(): Promise<void> {
       "startup renders real source snapshots without intermediate empty cards");
     console.log(`Startup UI trace: ${startupTrace.filter(entry => entry.tooltip).length} real hover snapshots; no default empty/starting card`);
   }
-  api.stop();
+  await api.stop();
   if (process.env.CSN_UI_PREVIEW_DONE) {
     const storage = join(process.env.CSN_TEST_USER_DATA_DIR!, "User", "globalStorage", extension.id.toLowerCase(), "monitor.sqlite");
     const store = new StateStore(extension.extensionPath, resolve(storage));
